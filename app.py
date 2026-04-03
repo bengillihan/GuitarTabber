@@ -9,7 +9,7 @@ from uuid import uuid4
 from flask import Flask, Response, abort, render_template_string, request, url_for
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
-from music21 import chord, converter, harmony, note, pitch, stream
+from music21 import chord, converter, harmony, meter, note, pitch, stream
 from werkzeug.utils import secure_filename
 
 
@@ -26,6 +26,9 @@ SLOT_WIDTH = 3  # 16th-note slot width in monospace characters
 MAX_SLOTS = 320  # Keep output readable for large files
 OMR_TIMEOUT_SECONDS = 120
 MEASURES_PER_ROW = 4
+# Approximate max monospace characters (tab columns) per rendered row before wrapping.
+# Row wrapping always happens at measure boundaries.
+TAB_TARGET_CHARS_PER_ROW = 96
 
 
 BASE_PAGE = """
@@ -160,6 +163,7 @@ BASE_PAGE = """
       border-radius: 8px;
       background: #faf8f1;
       padding: 0.7rem 0.8rem;
+      overflow-x: auto;
     }
     .tab-chords {
       color: #2e7d32;
@@ -175,6 +179,7 @@ BASE_PAGE = """
       font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
       font-size: 0.95rem;
       white-space: pre;
+      min-width: max-content;
     }
     .sl {
       line-height: 1.2;
@@ -184,6 +189,21 @@ BASE_PAGE = """
       color: #5f5a47;
       display: inline-block;
       width: 1.4rem;
+    }
+    @media (max-width: 700px) {
+      body {
+        padding: 1rem;
+      }
+      main {
+        padding: 1rem;
+      }
+      .tab-chords,
+      .tab-strings {
+        font-size: 0.82rem;
+      }
+      .tab-row {
+        padding: 0.55rem 0.6rem;
+      }
     }
     #processing {
       display: none;
@@ -528,6 +548,20 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
     unclamped_slots = max(total_slots + 1, 16)
     was_truncated = unclamped_slots > MAX_SLOTS
     total_slots = min(unclamped_slots, MAX_SLOTS)
+
+    # Fallback: some OMR exports flatten measure metadata. Synthesize bar starts
+    # from time signature so wrapping still happens at real measure boundaries.
+    if len(measure_slots) <= 1:
+        bar_quarters = 4.0
+        first_ts = None
+        for ts in score.recurse().getElementsByClass(meter.TimeSignature):
+            first_ts = ts
+            break
+        if first_ts is not None and first_ts.barDuration is not None:
+            bar_quarters = float(first_ts.barDuration.quarterLength)
+        bar_slots = max(1, quarter_to_slot(bar_quarters))
+        measure_slots = list(range(0, total_slots, bar_slots))
+
     return melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated
 
 
@@ -578,18 +612,40 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
     if not measure_starts or measure_starts[0] != 0:
         measure_starts = [0] + measure_starts
 
+    # Build row boundaries by keeping complete measures together while targeting
+    # a readable on-screen width.
+    row_ranges: list[tuple[int, int]] = []
+    idx = 0
+    max_slots_per_row = max(1, TAB_TARGET_CHARS_PER_ROW // SLOT_WIDTH)
+    while idx < len(measure_starts):
+        row_start_idx = idx
+        row_start_slot = measure_starts[row_start_idx]
+        row_end_idx = row_start_idx + 1
+
+        # Keep adding whole measures while we stay within both configured limits.
+        while row_end_idx < len(measure_starts):
+            if (row_end_idx - row_start_idx) >= MEASURES_PER_ROW:
+                break
+            candidate_end_slot = measure_starts[row_end_idx]
+            if (candidate_end_slot - row_start_slot) > max_slots_per_row:
+                break
+            row_end_idx += 1
+
+        if row_end_idx < len(measure_starts):
+            row_end_slot = measure_starts[row_end_idx]
+        else:
+            row_end_slot = total_slots
+
+        if row_end_slot <= row_start_slot:
+            row_end_slot = min(total_slots, row_start_slot + 1)
+
+        row_ranges.append((row_start_slot, row_end_slot))
+        idx = row_end_idx
+
     html_rows: list[str] = []
     plain_rows: list[str] = []
 
-    for start_idx in range(0, len(measure_starts), MEASURES_PER_ROW):
-        start_slot = measure_starts[start_idx]
-        if start_idx + MEASURES_PER_ROW < len(measure_starts):
-            end_slot = measure_starts[start_idx + MEASURES_PER_ROW]
-        else:
-            end_slot = total_slots
-        if end_slot <= start_slot:
-            end_slot = min(total_slots, start_slot + 1)
-
+    for start_slot, end_slot in row_ranges:
         char_start = start_slot * SLOT_WIDTH
         char_end = end_slot * SLOT_WIDTH
         chord_chunk = chord_line[char_start:char_end].rstrip()
