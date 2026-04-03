@@ -993,7 +993,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     played_chord_events: list[tuple[int, list[int]]] = []
     seen_played_slots: set[int] = set()
 
-    def get_global_offset(source_obj: stream.Music21Object) -> Optional[float]:
+    def get_global_offset(source_obj: Any) -> Optional[float]:
         try:
             return float(source_obj.getOffsetInHierarchy(score))
         except Exception:
@@ -1005,7 +1005,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                     return None
         return None
 
-    def add_chord_event(raw_label: str, source_obj: stream.Music21Object) -> None:
+    def add_chord_event(raw_label: str, source_obj: Any) -> None:
         label = extract_chord_token(raw_label)
         if not label or not CHORD_TEXT_RE.match(label) or not is_valid_chord_label(label):
             return
