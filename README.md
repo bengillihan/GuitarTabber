@@ -15,6 +15,13 @@ python3 app.py
 
 Open `http://127.0.0.1:5000` and upload a `.musicxml`, `.xml`, or `.mxl` file.
 
+## Database
+
+- Railway: set `DATABASE_URL` (or `Database_URL`) from your Postgres service.
+- Local fallback (no env var): SQLite file `guitartabber.db`.
+- Tables (`songs`, `arrangements`) are auto-created at app startup.
+- Visit `/history` to revisit saved tab outputs.
+
 ## Current scope
 
 - Upload MusicXML

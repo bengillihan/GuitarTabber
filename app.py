@@ -2,7 +2,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, render_template_string, request
+from flask import Flask, abort, render_template_string, request, url_for
+from flask_sqlalchemy import SQLAlchemy
 from music21 import chord, converter, harmony, note, pitch, stream
 from werkzeug.utils import secure_filename
 
@@ -16,17 +17,14 @@ STRING_NAMES = ["E", "A", "D", "G", "B", "E"]
 SLOT_WIDTH = 3  # 16th-note slot width in monospace characters
 MAX_SLOTS = 320  # Keep output readable for large files
 
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
 
-
-PAGE_TEMPLATE = """
+BASE_PAGE = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>GuitarTabber MVP</title>
+  <title>{{ page_title }}</title>
   <style>
     body {
       margin: 0;
@@ -48,8 +46,24 @@ PAGE_TEMPLATE = """
       margin-top: 0;
       font-size: 1.9rem;
     }
+    a {
+      color: #1f5d35;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+    }
+    a:hover {
+      border-bottom-color: #1f5d35;
+    }
     p {
       line-height: 1.5;
+    }
+    .topnav {
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      align-items: center;
+      flex-wrap: wrap;
     }
     .hint {
       color: #5f5a47;
@@ -94,6 +108,19 @@ PAGE_TEMPLATE = """
       margin-top: 1.25rem;
       padding-top: 1.25rem;
     }
+    .meta {
+      color: #4f4936;
+      font-size: 0.95rem;
+    }
+    .history-list {
+      list-style: none;
+      margin: 1rem 0;
+      padding: 0;
+    }
+    .history-list li {
+      padding: 0.7rem 0;
+      border-bottom: 1px solid #ece5ce;
+    }
     pre {
       background: #f8f6ef;
       border: 1px solid #e2dcc6;
@@ -108,30 +135,119 @@ PAGE_TEMPLATE = """
 </head>
 <body>
   <main>
-    <h1>GuitarTabber MVP</h1>
-    <p>Upload a MusicXML file and get a first-pass fingerstyle tab.</p>
-    <p class="hint">Supported formats: .musicxml, .xml, .mxl</p>
-
-    <form method="post" enctype="multipart/form-data">
-      <input type="file" name="music_file" accept=".musicxml,.xml,.mxl" required>
-      <button type="submit">Generate Tab</button>
-    </form>
-
-    {% if error %}
-      <div class="error">{{ error }}</div>
-    {% endif %}
-
-    {% if result %}
-      <section class="result">
-        <h2>{{ result.title }}</h2>
-        <p><strong>Uploaded file:</strong> {{ result.filename }}</p>
-        <pre>{{ result.tab }}</pre>
-      </section>
-    {% endif %}
+    {{ body|safe }}
   </main>
 </body>
 </html>
 """
+
+
+HOME_BODY = """
+<div class="topnav">
+  <h1>GuitarTabber MVP</h1>
+  <a href="{{ url_for('history') }}">View History</a>
+</div>
+<p>Upload a MusicXML file and get a first-pass fingerstyle tab.</p>
+<p class="hint">Supported formats: .musicxml, .xml, .mxl</p>
+
+<form method="post" enctype="multipart/form-data">
+  <input type="file" name="music_file" accept=".musicxml,.xml,.mxl" required>
+  <button type="submit">Generate Tab</button>
+</form>
+
+{% if error %}
+  <div class="error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+  <section class="result">
+    <h2>{{ result.title }}</h2>
+    <p class="meta"><strong>Uploaded file:</strong> {{ result.filename }}</p>
+    <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a></p>
+    <pre>{{ result.tab }}</pre>
+  </section>
+{% endif %}
+"""
+
+
+HISTORY_BODY = """
+<div class="topnav">
+  <h1>Saved Arrangements</h1>
+  <a href="{{ url_for('index') }}">Upload New Song</a>
+</div>
+
+{% if rows %}
+  <ul class="history-list">
+    {% for row in rows %}
+      <li>
+        <a href="{{ url_for('view_arrangement', arrangement_id=row.id) }}">{{ row.song_title }}</a>
+        <div class="meta">File: {{ row.original_filename }} | {{ row.created_at }}</div>
+      </li>
+    {% endfor %}
+  </ul>
+{% else %}
+  <p>No saved arrangements yet. Upload one from the home page.</p>
+{% endif %}
+"""
+
+
+ARRANGEMENT_BODY = """
+<div class="topnav">
+  <h1>{{ row.song_title }}</h1>
+  <a href="{{ url_for('history') }}">Back To History</a>
+</div>
+<p class="meta"><strong>Original file:</strong> {{ row.original_filename }}</p>
+<p class="meta"><strong>Estimated key:</strong> {{ row.key_name }}</p>
+<p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
+<pre>{{ row.tab_text }}</pre>
+"""
+
+
+def normalize_database_url(raw_url: Optional[str]) -> str:
+    if not raw_url:
+        return "sqlite:///guitartabber.db"
+    if raw_url.startswith("postgres://"):
+        return raw_url.replace("postgres://", "postgresql://", 1)
+    return raw_url
+
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
+raw_db_url = os.getenv("DATABASE_URL") or os.getenv("Database_URL")
+app.config["SQLALCHEMY_DATABASE_URI"] = normalize_database_url(raw_db_url)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+
+
+class Song(db.Model):
+    __tablename__ = "songs"
+
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    original_filename = db.Column(db.String(255), nullable=False)
+    mime_type = db.Column(db.String(120), nullable=False)
+    file_data = db.Column(db.LargeBinary, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+
+
+class Arrangement(db.Model):
+    __tablename__ = "arrangements"
+
+    id = db.Column(db.Integer, primary_key=True)
+    song_id = db.Column(db.Integer, db.ForeignKey("songs.id", ondelete="CASCADE"), nullable=False)
+    key_name = db.Column(db.String(80), nullable=False)
+    tab_text = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
+
+
+with app.app_context():
+    db.create_all()
+
+
+def render_page(body_template: str, **context: object) -> str:
+    body = render_template_string(body_template, **context)
+    return render_template_string(BASE_PAGE, page_title="GuitarTabber", body=body)
 
 
 def is_allowed_file(filename: str) -> bool:
@@ -245,10 +361,8 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
 def arrange_tab(score: stream.Score) -> str:
     melody_events, bass_events, measure_slots, chord_events, total_slots = gather_events(score)
 
-    # Keep output strings indexed low-to-high internally; format high-to-low for display.
     lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
 
-    # Melody preference: high E, B, G, D, A, E.
     for slot, midi_value in melody_events:
         if slot >= total_slots:
             continue
@@ -259,7 +373,6 @@ def arrange_tab(score: stream.Score) -> str:
         if slot_is_free(lines[string_index], slot):
             place_token(lines[string_index], slot, str(fret))
 
-    # Bass preference: low E, A, D, then fallback higher if needed.
     for slot, midi_value in bass_events:
         if slot >= total_slots:
             continue
@@ -283,7 +396,7 @@ def arrange_tab(score: stream.Score) -> str:
     return "\n".join(rendered)
 
 
-def build_result(saved_path: Path, safe_name: str) -> dict[str, str]:
+def parse_musicxml(saved_path: Path, safe_name: str) -> dict[str, str]:
     score = converter.parse(str(saved_path))
 
     title = safe_name
@@ -307,8 +420,8 @@ def build_result(saved_path: Path, safe_name: str) -> dict[str, str]:
     ]
 
     return {
-        "title": "Easy Fingerstyle Tab (MVP v1)",
-        "filename": safe_name,
+        "song_title": title,
+        "key_name": key_name,
         "tab": "\n".join(header) + tab,
     }
 
@@ -332,11 +445,75 @@ def index():
             upload.save(saved_path)
 
             try:
-                result = build_result(saved_path, safe_name)
+                parsed = parse_musicxml(saved_path, safe_name)
+                file_bytes = saved_path.read_bytes()
+                song = Song(
+                    title=parsed["song_title"],
+                    original_filename=safe_name,
+                    mime_type=upload.mimetype or "application/octet-stream",
+                    file_data=file_bytes,
+                )
+                db.session.add(song)
+                db.session.flush()
+
+                arrangement = Arrangement(
+                    song_id=song.id,
+                    key_name=parsed["key_name"],
+                    tab_text=parsed["tab"],
+                )
+                db.session.add(arrangement)
+                db.session.commit()
+
+                result = {
+                    "title": "Easy Fingerstyle Tab (Saved)",
+                    "filename": safe_name,
+                    "tab": parsed["tab"],
+                    "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
+                }
             except Exception as exc:
+                db.session.rollback()
                 error = f"Could not parse MusicXML: {exc}"
 
-    return render_template_string(PAGE_TEMPLATE, error=error, result=result)
+    return render_page(HOME_BODY, error=error, result=result)
+
+
+@app.route("/history", methods=["GET"])
+def history():
+    rows = (
+        db.session.query(
+            Arrangement.id.label("id"),
+            Song.title.label("song_title"),
+            Song.original_filename.label("original_filename"),
+            Arrangement.created_at.label("created_at"),
+        )
+        .join(Song, Arrangement.song_id == Song.id)
+        .order_by(Arrangement.created_at.desc(), Arrangement.id.desc())
+        .limit(100)
+        .all()
+    )
+    return render_page(HISTORY_BODY, rows=rows)
+
+
+@app.route("/arrangement/<int:arrangement_id>", methods=["GET"])
+def view_arrangement(arrangement_id: int):
+    row = (
+        db.session.query(
+            Arrangement.id.label("id"),
+            Arrangement.tab_text.label("tab_text"),
+            Arrangement.key_name.label("key_name"),
+            Arrangement.created_at.label("created_at"),
+            Song.title.label("song_title"),
+            Song.original_filename.label("original_filename"),
+        )
+        .join(Song, Arrangement.song_id == Song.id)
+        .filter(Arrangement.id == arrangement_id)
+        .first()
+    )
+
+    if row is None:
+        abort(404)
+
+    return render_page(ARRANGEMENT_BODY, row=row)
 
 
 if __name__ == "__main__":
