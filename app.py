@@ -30,6 +30,7 @@ MEASURES_PER_ROW = 4
 # Approximate max monospace characters (tab columns) per rendered row before wrapping.
 # Row wrapping always happens at measure boundaries.
 TAB_TARGET_CHARS_PER_ROW = 192
+MAX_FRETTED_SPAN = 5
 KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
 
@@ -485,17 +486,35 @@ def quarter_to_slot(quarter_length: float) -> int:
 
 
 def find_position(midi_value: int, preferred_strings: list[int], max_fret: int = 14) -> Optional[tuple[int, int]]:
+    positions = find_positions(midi_value, preferred_strings, max_fret=max_fret)
+    return positions[0] if positions else None
+
+
+def find_positions(midi_value: int, preferred_strings: list[int], max_fret: int = 14) -> list[tuple[int, int]]:
     candidates: list[tuple[int, int]] = []
     for string_index in preferred_strings:
         fret = midi_value - STANDARD_TUNING[string_index]
         if 0 <= fret <= max_fret:
             candidates.append((string_index, fret))
     if not candidates:
-        return None
+        return []
     # Prefer open strings, then lower frets, then the caller's string priority order.
     priority_index = {s: i for i, s in enumerate(preferred_strings)}
     candidates.sort(key=lambda c: (0 if c[1] == 0 else 1, c[1], priority_index.get(c[0], 99)))
-    return candidates[0]
+    return candidates
+
+
+def can_place_fret_at_slot(
+    slot_frets: list[int],
+    fret: int,
+    max_fretted_span: int = MAX_FRETTED_SPAN,
+) -> bool:
+    fretted = [f for f in slot_frets if f > 0]
+    if fret > 0:
+        fretted.append(fret)
+    if len(fretted) < 2:
+        return True
+    return (max(fretted) - min(fretted)) <= max_fretted_span
 
 
 def slot_is_free(line: list[str], slot: int) -> bool:
@@ -701,26 +720,35 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
     melody_events, bass_events, measure_slots, chord_events, section_events, total_slots, was_truncated = gather_events(score)
 
     lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
+    slot_fretted_notes: dict[int, list[int]] = {}
 
     for slot, midi_value in melody_events:
         if slot >= total_slots:
             continue
-        pos = find_position(midi_value, preferred_strings=[5, 4, 3, 2], max_fret=14)
-        if pos is None:
-            continue
-        string_index, fret = pos
-        if slot_is_free(lines[string_index], slot):
+        candidates = find_positions(midi_value, preferred_strings=[5, 4, 3, 2], max_fret=14)
+        for string_index, fret in candidates:
+            if not slot_is_free(lines[string_index], slot):
+                continue
+            existing_frets = slot_fretted_notes.get(slot, [])
+            if not can_place_fret_at_slot(existing_frets, fret):
+                continue
             place_token(lines[string_index], slot, str(fret))
+            slot_fretted_notes.setdefault(slot, []).append(fret)
+            break
 
     for slot, midi_value in bass_events:
         if slot >= total_slots:
             continue
-        pos = find_position(midi_value, preferred_strings=[0, 1, 2, 3], max_fret=10)
-        if pos is None:
-            continue
-        string_index, fret = pos
-        if slot_is_free(lines[string_index], slot):
+        candidates = find_positions(midi_value, preferred_strings=[0, 1, 2, 3], max_fret=10)
+        for string_index, fret in candidates:
+            if not slot_is_free(lines[string_index], slot):
+                continue
+            existing_frets = slot_fretted_notes.get(slot, [])
+            if not can_place_fret_at_slot(existing_frets, fret):
+                continue
             place_token(lines[string_index], slot, str(fret))
+            slot_fretted_notes.setdefault(slot, []).append(fret)
+            break
 
     place_measure_dividers(lines, measure_slots)
 
