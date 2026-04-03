@@ -1097,13 +1097,41 @@ def keep_easy_chord_slot(slot: int, measure_starts: list[int], first_ts: Optiona
     return in_measure == 0
 
 
+def _part_has_lyrics(part: stream.Stream) -> bool:
+    """Return True if any note in the part has an attached lyric."""
+    for n in part.flatten().notes:
+        if isinstance(n, note.Note):
+            if getattr(n, "lyric", None):
+                return True
+            if any(getattr(lyr, "text", None) for lyr in (getattr(n, "lyrics", []) or [])):
+                return True
+    return False
+
+
+def _melody_note_count(part: stream.Stream) -> int:
+    """Count distinct melody-range notes (MIDI 55–84) in a part."""
+    slots: set[int] = set()
+    for n in part.flatten().notes:
+        if isinstance(n, note.Note) and 55 <= int(n.pitch.midi) <= 84:
+            slots.add(quarter_to_slot(float(n.offset)))
+        elif isinstance(n, chord.Chord):
+            top = max(int(p.midi) for p in n.pitches)
+            if 55 <= top <= 84:
+                slots.add(quarter_to_slot(float(n.offset)))
+    return len(slots)
+
+
 def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.STANDARD) -> ScoreEvents:
     full_flat = score.flatten()
     parts = list(score.parts)
 
-    # Voice-aware extraction for SATB/hymn scores:
-    # melody from first part voice 1 (soprano), bass from last part voice 2.
-    melody_source = parts[0] if parts else full_flat
+    # For vocal+piano arrangements, prefer the part that has lyrics attached
+    # (the vocal line), falling back to parts[0].
+    if parts:
+        lyric_part = next((p for p in parts if _part_has_lyrics(p)), None)
+        melody_source = lyric_part if lyric_part is not None else parts[0]
+    else:
+        melody_source = full_flat
     bass_source = parts[-1] if parts else full_flat
 
     def choose_voice(source: stream.Stream, preferred_voice: str) -> Optional[str]:
@@ -1227,19 +1255,43 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             bass_max_slot = max(bass_max_slot, low_staff_max_slot)
 
     # Fallback: if voice-filtering produces sparse melody (common in imperfect OMR),
-    # fall back to unfiltered first-part melody using a relative threshold.
+    # try progressively broader sources until we get enough notes.
     if parts:
-        first_part_noteheads = 0
-        for el in parts[0].flatten().notes:
-            if isinstance(el, note.Note):
-                first_part_noteheads += 1
-            elif isinstance(el, chord.Chord):
-                first_part_noteheads += len(el.pitches)
-        sparse_threshold = max(4, int(first_part_noteheads * 0.25))
+        # Count total noteheads in the score as a reference for "sparse".
+        all_noteheads = sum(
+            1 if isinstance(el, note.Note) else len(el.pitches)
+            for el in full_flat.notes
+        )
+        sparse_threshold = max(4, int(all_noteheads * 0.05))
+
         if len(melody_events) < sparse_threshold:
-            fallback_melody, fallback_max = collect_part_events(parts[0], mode="high", voice_filter=None)
+            # Try unfiltered melody source first.
+            fallback_melody, fallback_max = collect_part_events(melody_source, mode="high", voice_filter=None)
             if len(fallback_melody) > len(melody_events):
                 melody_events, melody_max_slot = fallback_melody, fallback_max
+
+        if len(melody_events) < sparse_threshold:
+            # Try every part independently; pick the one richest in melody-range notes.
+            best_candidate: list[tuple[int, int]] = melody_events
+            best_max = melody_max_slot
+            for part in parts:
+                candidate, candidate_max = collect_highest_per_slot(part)
+                if _melody_note_count(part) > _melody_note_count(melody_source) and len(candidate) > len(best_candidate):
+                    best_candidate = candidate
+                    best_max = candidate_max
+            if best_candidate is not melody_events:
+                melody_events, melody_max_slot = best_candidate, best_max
+
+        if len(melody_events) < sparse_threshold:
+            # Last resort: collect highest note per slot across ALL treble parts.
+            all_treble_slots: dict[int, int] = {}
+            for part in parts[:-1]:  # exclude last part (bass)
+                for s, midi_val in collect_highest_per_slot(part)[0]:
+                    if s not in all_treble_slots or midi_val > all_treble_slots[s]:
+                        all_treble_slots[s] = midi_val
+            if len(all_treble_slots) > len(melody_events):
+                melody_events = sorted(all_treble_slots.items())
+                melody_max_slot = max((s for s in all_treble_slots), default=melody_max_slot) + 1
 
     total_slots = max(melody_max_slot, bass_max_slot)
 
@@ -1402,6 +1454,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     beat = 0.0
     last_inferred_label = ""
+    last_inferred_root = ""
     while beat <= max_offset:
         beat_slot = quarter_to_slot(beat)
         if beat_slot in seen_chord_slots:
@@ -1427,9 +1480,11 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             symbol = harmony.chordSymbolFromChord(guessed)
             label = symbol.figure if symbol and symbol.figure else ""
             label = normalize_chord_label(label)
-            if label and is_valid_chord_label(label) and label != last_inferred_label:
+            label_root = label.split("/")[0] if "/" in label else label
+            if label and is_valid_chord_label(label) and label != last_inferred_label and label_root != last_inferred_root:
                 chord_events.append((beat_slot, label))
                 last_inferred_label = label
+                last_inferred_root = label_root
 
         beat += beat_step
 
@@ -1526,17 +1581,24 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     # Final harmonic fallback: derive simple chord labels from played chord
     # events when explicit symbols/text are sparse or missing.
-    # Only emit a label when the chord name *changes* to avoid flooding dense
-    # accompaniment with identical consecutive labels.
+    # Only emit a label when the chord ROOT changes — this prevents walking bass
+    # passing tones (e.g. C/E, C/G) from flooding the display when the chord
+    # hasn't actually changed.
     last_fallback_label = ""
+    last_fallback_root = ""
     for slot, midi_values in sorted(played_chord_events, key=lambda x: x[0]):
         if slot in seen_chord_slots:
             continue
         guessed = normalize_chord_label(infer_simple_chord_label(midi_values))
-        if guessed and is_valid_chord_label(guessed) and guessed != last_fallback_label:
-            seen_chord_slots.add(slot)
-            chord_events.append((slot, guessed))
-            last_fallback_label = guessed
+        if not guessed or not is_valid_chord_label(guessed):
+            continue
+        guessed_root = guessed.split("/")[0]
+        if guessed == last_fallback_label or guessed_root == last_fallback_root:
+            continue
+        seen_chord_slots.add(slot)
+        chord_events.append((slot, guessed))
+        last_fallback_label = guessed
+        last_fallback_root = guessed_root
 
     # Lyric-anchored labels: carry active harmony onto lyric-note slots so
     # users see chord names where words occur in lead sheets.
