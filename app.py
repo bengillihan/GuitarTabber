@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import html
+import tempfile
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
@@ -890,6 +891,24 @@ def render_score_to_tab_payload(score: stream.Score, title: str, source_label: s
 
 
 def parse_musicxml_bytes(file_bytes: bytes) -> stream.Score:
+    # Compressed MusicXML (.mxl) is a zip container ("PK...") and is more
+    # reliable when parsed from a real file path.
+    if file_bytes.startswith(b"PK"):
+        temp_path: Optional[str] = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".mxl", delete=False) as temp_file:
+                temp_file.write(file_bytes)
+                temp_path = temp_file.name
+            return converter.parse(temp_path)
+        except Exception:
+            pass
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+
     try:
         return converter.parseData(file_bytes)
     except Exception:
