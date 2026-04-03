@@ -2,6 +2,7 @@ import os
 import shutil
 import subprocess
 import html
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -29,6 +30,8 @@ MEASURES_PER_ROW = 4
 # Approximate max monospace characters (tab columns) per rendered row before wrapping.
 # Row wrapping always happens at measure boundaries.
 TAB_TARGET_CHARS_PER_ROW = 96
+KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+KEY_MODES = ["major", "minor"]
 
 
 BASE_PAGE = """
@@ -107,6 +110,18 @@ BASE_PAGE = """
     }
     button:hover {
       background: #245734;
+    }
+    .transpose-form {
+      margin: 0.9rem 0;
+    }
+    .transpose-form select {
+      border: 1px solid #d0c8af;
+      background: #fff;
+      border-radius: 6px;
+      padding: 0.45rem 0.5rem;
+      font-size: 0.95rem;
+      color: #2b2b2b;
+      min-width: 10rem;
     }
     .error {
       border: 1px solid #d89f9f;
@@ -303,6 +318,21 @@ ARRANGEMENT_BODY = """
 <p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
 <p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
 <p class="meta"><a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab as .txt</a></p>
+<form method="post" class="transpose-form">
+  <label for="target_key"><strong>Change key:</strong></label>
+  <select id="target_key" name="target_key">
+    {% for option in key_options %}
+      <option value="{{ option }}" {% if option == selected_key %}selected{% endif %}>{{ option }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit">Update Tab</button>
+</form>
+{% if transpose_error %}
+  <div class="error">{{ transpose_error }}</div>
+{% endif %}
+{% if transpose_note %}
+  <p class="meta">{{ transpose_note }}</p>
+{% endif %}
 {% if row.tab_html %}
   {{ row.tab_html|safe }}
 {% else %}
@@ -693,6 +723,77 @@ def suggest_capo(key_name: str) -> str:
     return "No strong capo suggestion"
 
 
+def build_key_options() -> list[str]:
+    return [f"{tonic} {mode}" for mode in KEY_MODES for tonic in KEY_TONICS]
+
+
+def parse_key_name(key_name: str) -> Optional[tuple[pitch.Pitch, str]]:
+    try:
+        tonic_name, mode = key_name.split(" ", 1)
+    except ValueError:
+        return None
+    mode = mode.strip().lower()
+    if mode not in KEY_MODES:
+        return None
+    try:
+        tonic = pitch.Pitch(tonic_name.strip())
+    except Exception:
+        return None
+    return tonic, mode
+
+
+def render_score_to_tab_payload(score: stream.Score, title: str, source_label: str) -> dict[str, str]:
+    key_name = "Unknown"
+    try:
+        analyzed_key = score.analyze("key")
+        key_name = f"{analyzed_key.tonic.name} {analyzed_key.mode}"
+    except Exception:
+        pass
+
+    tab_html, tab_plain, was_truncated = arrange_tab(score)
+    header = [
+        f"# {title}",
+        f"# Source file: {source_label}",
+        f"# Estimated key: {key_name}",
+        "# Layout: basic melody (high strings) + bass (low strings)",
+        "",
+    ]
+    return {
+        "key_name": key_name,
+        "capo_suggestion": suggest_capo(key_name),
+        "tab_text": "\n".join(header) + tab_plain,
+        "tab_html": tab_html,
+        "truncation_warning": (
+            f"This score was truncated for display at {MAX_SLOTS} tab slots. Split into sections for full output."
+            if was_truncated
+            else ""
+        ),
+    }
+
+
+def parse_musicxml_bytes(file_bytes: bytes) -> stream.Score:
+    try:
+        return converter.parseData(file_bytes)
+    except Exception:
+        try:
+            return converter.parseData(file_bytes.decode("utf-8", errors="ignore"))
+        except Exception as exc:
+            raise ScoreParseError(f"Saved source file could not be parsed: {exc}") from exc
+
+
+def transpose_score_between_keys(score: stream.Score, source_key_name: str, target_key_name: str) -> stream.Score:
+    source = parse_key_name(source_key_name)
+    target = parse_key_name(target_key_name)
+    if source is None or target is None:
+        return score
+    source_tonic, _ = source
+    target_tonic, _ = target
+    semitones = (target_tonic.pitchClass - source_tonic.pitchClass) % 12
+    if semitones > 6:
+        semitones -= 12
+    return score.transpose(semitones, inPlace=False)
+
+
 def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict[str, Any]:
     parse_paths: list[Path] = [saved_path]
     source_label = safe_name
@@ -716,36 +817,17 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
     if score.metadata and score.metadata.title:
         title = str(score.metadata.title)
 
-    key_name = "Unknown"
-    try:
-        analyzed_key = score.analyze("key")
-        key_name = f"{analyzed_key.tonic.name} {analyzed_key.mode}"
-    except Exception:
-        pass
-
-    tab_html, tab_plain, was_truncated = arrange_tab(score)
-    capo_suggestion = suggest_capo(key_name)
-    header = [
-        f"# {title}",
-        f"# Source file: {source_label}",
-        f"# Estimated key: {key_name}",
-        "# Layout: basic melody (high strings) + bass (low strings)",
-        "",
-    ]
+    rendered = render_score_to_tab_payload(score, title, source_label)
 
     return {
         "song_title": title,
-        "key_name": key_name,
-        "capo_suggestion": capo_suggestion,
+        "key_name": rendered["key_name"],
+        "capo_suggestion": rendered["capo_suggestion"],
         "musicxml_bytes": parse_paths[0].read_bytes(),
-        "truncation_warning": (
-            f"This score was truncated for display at {MAX_SLOTS} tab slots. Split into sections for full output."
-            if was_truncated
-            else ""
-        ),
+        "truncation_warning": rendered["truncation_warning"],
         "multi_page_warning": multi_page_warning,
-        "tab_text": "\n".join(header) + tab_plain,
-        "tab_html": tab_html,
+        "tab_text": rendered["tab_text"],
+        "tab_html": rendered["tab_html"],
     }
 
 
@@ -849,7 +931,7 @@ def history():
     return render_page(HISTORY_BODY, rows=formatted_rows)
 
 
-@app.route("/arrangement/<int:arrangement_id>", methods=["GET"])
+@app.route("/arrangement/<int:arrangement_id>", methods=["GET", "POST"])
 def view_arrangement(arrangement_id: int):
     row = (
         db.session.query(
@@ -861,6 +943,7 @@ def view_arrangement(arrangement_id: int):
             Arrangement.created_at.label("created_at"),
             Song.title.label("song_title"),
             Song.original_filename.label("original_filename"),
+            Song.file_data.label("file_data"),
         )
         .join(Song, Arrangement.song_id == Song.id)
         .filter(Arrangement.id == arrangement_id)
@@ -870,7 +953,49 @@ def view_arrangement(arrangement_id: int):
     if row is None:
         abort(404)
 
-    return render_page(ARRANGEMENT_BODY, row=row)
+    key_options = build_key_options()
+    selected_key = row.key_name if row.key_name in key_options else key_options[0]
+    transpose_error = None
+    transpose_note = None
+    display = {
+        "id": row.id,
+        "tab_text": row.tab_text,
+        "tab_html": row.tab_html,
+        "key_name": row.key_name,
+        "capo_suggestion": row.capo_suggestion,
+        "created_at": row.created_at,
+        "song_title": row.song_title,
+        "original_filename": row.original_filename,
+    }
+
+    if request.method == "POST":
+        selected_key = (request.form.get("target_key") or "").strip()
+        if selected_key not in key_options:
+            transpose_error = "Please choose a valid target key."
+        else:
+            try:
+                score = parse_musicxml_bytes(row.file_data)
+                transposed = transpose_score_between_keys(score, row.key_name, selected_key)
+                source_label = f"{row.original_filename} (transposed to {selected_key})"
+                rendered = render_score_to_tab_payload(transposed, row.song_title, source_label)
+                display["tab_text"] = rendered["tab_text"]
+                display["tab_html"] = rendered["tab_html"]
+                display["key_name"] = rendered["key_name"]
+                display["capo_suggestion"] = rendered["capo_suggestion"]
+                transpose_note = f"Showing transposed preview in {selected_key}. Saved arrangement remains unchanged."
+                if rendered["truncation_warning"]:
+                    transpose_note = f"{transpose_note} {rendered['truncation_warning']}"
+            except Exception as exc:
+                transpose_error = f"Could not transpose this arrangement: {exc}"
+
+    return render_page(
+        ARRANGEMENT_BODY,
+        row=SimpleNamespace(**display),
+        key_options=key_options,
+        selected_key=selected_key,
+        transpose_error=transpose_error,
+        transpose_note=transpose_note,
+    )
 
 
 @app.route("/arrangement/<int:arrangement_id>/download", methods=["GET"])
