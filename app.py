@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ STANDARD_TUNING = [40, 45, 50, 55, 59, 64]
 STRING_NAMES = ["E", "A", "D", "G", "B", "E"]
 SLOT_WIDTH = 3  # 16th-note slot width in monospace characters
 MAX_SLOTS = 320  # Keep output readable for large files
+OMR_TIMEOUT_SECONDS = 120
 
 
 BASE_PAGE = """
@@ -108,6 +110,14 @@ BASE_PAGE = """
       padding: 0.65rem;
       margin: 1rem 0;
     }
+    .warning {
+      border: 1px solid #d7bf8a;
+      background: #fff8e7;
+      color: #745b25;
+      border-radius: 6px;
+      padding: 0.65rem;
+      margin: 1rem 0;
+    }
     .result {
       border-top: 1px solid #e6dfc9;
       margin-top: 1.25rem;
@@ -136,6 +146,12 @@ BASE_PAGE = """
       font-size: 0.93rem;
       line-height: 1.35;
     }
+    #processing {
+      display: none;
+      margin-top: 0.75rem;
+      color: #2f5f3b;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -155,10 +171,15 @@ HOME_BODY = """
 <p>Upload a MusicXML file and get a first-pass fingerstyle tab.</p>
 <p class="hint">Supported formats: .musicxml, .xml, .mxl, .pdf, .png, .jpg, .jpeg, .webp</p>
 
-<form method="post" enctype="multipart/form-data">
+{% if omr_warning %}
+  <div class="warning">{{ omr_warning }}</div>
+{% endif %}
+
+<form method="post" enctype="multipart/form-data" id="upload-form">
   <input type="file" name="music_file" accept=".musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.webp" required>
   <button type="submit">Generate Tab</button>
 </form>
+<div id="processing">Processing upload... OMR on PDFs/images can take up to a minute.</div>
 
 {% if error %}
   <div class="error">{{ error }}</div>
@@ -168,10 +189,24 @@ HOME_BODY = """
   <section class="result">
     <h2>{{ result.title }}</h2>
     <p class="meta"><strong>Uploaded file:</strong> {{ result.filename }}</p>
+    <p class="meta"><strong>Estimated key:</strong> {{ result.key_name }} | <strong>Capo suggestion:</strong> {{ result.capo_suggestion }}</p>
+    {% if result.truncation_warning %}
+      <div class="warning">{{ result.truncation_warning }}</div>
+    {% endif %}
     <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a></p>
     <pre>{{ result.tab }}</pre>
   </section>
 {% endif %}
+
+<script>
+  const form = document.getElementById("upload-form");
+  const processing = document.getElementById("processing");
+  if (form && processing) {
+    form.addEventListener("submit", () => {
+      processing.style.display = "block";
+    });
+  }
+</script>
 """
 
 
@@ -250,6 +285,14 @@ with app.app_context():
     db.create_all()
 
 
+class OMRConversionError(Exception):
+    pass
+
+
+class ScoreParseError(Exception):
+    pass
+
+
 def render_page(body_template: str, **context: object) -> str:
     body = render_template_string(body_template, **context)
     return render_template_string(BASE_PAGE, page_title="GuitarTabber", body=body)
@@ -270,17 +313,27 @@ def omr_input_needs_conversion(filename: str) -> bool:
     return ext in PDF_EXTENSIONS or ext in IMAGE_EXTENSIONS
 
 
-def convert_sheet_to_musicxml(source_path: Path) -> Path:
+def is_omr_available() -> bool:
+    audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
+    resolved = shutil.which(audiveris_bin)
+    return resolved is not None
+
+
+def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
     """Convert PDF/image sheet music to MusicXML using Audiveris."""
     audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
-    output_dir = UPLOAD_DIR / "omr_exports" / f"{source_path.stem}-{uuid4().hex[:8]}"
+    output_dir = work_dir / "omr_exports"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [audiveris_bin, "-batch", "-export", "-output", str(output_dir), str(source_path)]
     try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        raise OMRConversionError(
+            f"OMR timed out after {OMR_TIMEOUT_SECONDS}s. Try a smaller/cropped PDF page."
+        ) from exc
     except FileNotFoundError as exc:
-        raise RuntimeError(
+        raise OMRConversionError(
             "Audiveris is not installed or not found. Set AUDIVERIS_BIN or upload MusicXML directly."
         ) from exc
 
@@ -288,16 +341,16 @@ def convert_sheet_to_musicxml(source_path: Path) -> Path:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
         detail = stderr or stdout or f"exit code {completed.returncode}"
-        raise RuntimeError(f"Audiveris conversion failed: {detail}")
+        raise OMRConversionError(f"Audiveris conversion failed: {detail}")
 
     generated = []
     for pattern in ("*.musicxml", "*.mxl", "*.xml"):
         generated.extend(output_dir.rglob(pattern))
 
     if not generated:
-        raise RuntimeError("Audiveris ran but no MusicXML output was produced.")
+        raise OMRConversionError("Audiveris ran but no MusicXML output was produced.")
 
-    return max(generated, key=lambda p: p.stat().st_mtime)
+    return sorted(generated)
 
 
 def quarter_to_slot(quarter_length: float) -> int:
@@ -305,11 +358,17 @@ def quarter_to_slot(quarter_length: float) -> int:
 
 
 def find_position(midi_value: int, preferred_strings: list[int], max_fret: int = 14) -> Optional[tuple[int, int]]:
+    candidates: list[tuple[int, int]] = []
     for string_index in preferred_strings:
         fret = midi_value - STANDARD_TUNING[string_index]
         if 0 <= fret <= max_fret:
-            return string_index, fret
-    return None
+            candidates.append((string_index, fret))
+    if not candidates:
+        return None
+    # Prefer open strings, then lower frets, then the caller's string priority order.
+    priority_index = {s: i for i, s in enumerate(preferred_strings)}
+    candidates.sort(key=lambda c: (0 if c[1] == 0 else 1, c[1], priority_index.get(c[0], 99)))
+    return candidates[0]
 
 
 def slot_is_free(line: list[str], slot: int) -> bool:
@@ -350,7 +409,7 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
     return "".join(line).rstrip()
 
 
-def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[int], list[tuple[int, str]], int]:
+def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[int], list[tuple[int, str]], int, bool]:
     flat = score.flatten()
 
     melody_events: list[tuple[int, int]] = []
@@ -400,12 +459,14 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
 
         beat += 1.0
 
-    total_slots = min(max(total_slots + 1, 16), MAX_SLOTS)
-    return melody_events, bass_events, measure_slots, chord_events, total_slots
+    unclamped_slots = max(total_slots + 1, 16)
+    was_truncated = unclamped_slots > MAX_SLOTS
+    total_slots = min(unclamped_slots, MAX_SLOTS)
+    return melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated
 
 
-def arrange_tab(score: stream.Score) -> str:
-    melody_events, bass_events, measure_slots, chord_events, total_slots = gather_events(score)
+def arrange_tab(score: stream.Score) -> tuple[str, bool]:
+    melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated = gather_events(score)
 
     lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
 
@@ -439,17 +500,44 @@ def arrange_tab(score: stream.Score) -> str:
     for string_index in [5, 4, 3, 2, 1, 0]:
         rendered.append(f"{STRING_NAMES[string_index]}|{''.join(lines[string_index])}|")
 
-    return "\n".join(rendered)
+    return "\n".join(rendered), was_truncated
 
 
-def parse_sheet_to_tab(saved_path: Path, safe_name: str) -> dict[str, str]:
-    parse_path = saved_path
+def suggest_capo(key_name: str) -> str:
+    try:
+        tonic_name, mode = key_name.split(" ", 1)
+    except ValueError:
+        return "No suggestion"
+
+    open_majors = {"C", "G", "D", "A", "E"}
+    open_minors = {"A", "E", "D"}
+    tonic = pitch.Pitch(tonic_name)
+
+    for capo in range(0, 8):
+        shifted = pitch.Pitch()
+        shifted.midi = tonic.midi - capo
+        candidate = shifted.name
+        if mode == "major" and candidate in open_majors:
+            return "No capo needed" if capo == 0 else f"Capo {capo} (play in {candidate})"
+        if mode == "minor" and candidate in open_minors:
+            return "No capo needed" if capo == 0 else f"Capo {capo} (play in {candidate}m)"
+    return "No strong capo suggestion"
+
+
+def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict[str, str]:
+    parse_paths: list[Path] = [saved_path]
     source_label = safe_name
     if omr_input_needs_conversion(safe_name):
-        parse_path = convert_sheet_to_musicxml(saved_path)
-        source_label = f"{safe_name} (via OMR: {parse_path.name})"
+        parse_paths = convert_sheet_to_musicxml(saved_path, work_dir)
+        if len(parse_paths) == 1:
+            source_label = f"{safe_name} (via OMR: {parse_paths[0].name})"
+        else:
+            source_label = f"{safe_name} (via OMR: {len(parse_paths)} exported files, using first)"
 
-    score = converter.parse(str(parse_path))
+    try:
+        score = converter.parse(str(parse_paths[0]))
+    except Exception as exc:
+        raise ScoreParseError(f"MusicXML parsing failed: {exc}") from exc
 
     title = safe_name
     if score.metadata and score.metadata.title:
@@ -462,7 +550,8 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str) -> dict[str, str]:
     except Exception:
         pass
 
-    tab = arrange_tab(score)
+    tab, was_truncated = arrange_tab(score)
+    capo_suggestion = suggest_capo(key_name)
     header = [
         f"# {title}",
         f"# Source file: {source_label}",
@@ -474,6 +563,12 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str) -> dict[str, str]:
     return {
         "song_title": title,
         "key_name": key_name,
+        "capo_suggestion": capo_suggestion,
+        "truncation_warning": (
+            f"This score was truncated for display at {MAX_SLOTS} tab slots. Split into sections for full output."
+            if was_truncated
+            else ""
+        ),
         "tab": "\n".join(header) + tab,
     }
 
@@ -482,6 +577,9 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str) -> dict[str, str]:
 def index():
     error = None
     result = None
+    omr_warning = None
+    if not is_omr_available():
+        omr_warning = "OMR is currently unavailable on this server. PDF/image uploads may fail; MusicXML uploads still work."
 
     if request.method == "POST":
         upload = request.files.get("music_file")
@@ -491,13 +589,15 @@ def index():
         elif not is_allowed_file(upload.filename):
             error = "Unsupported file type. Upload MusicXML, PDF, or sheet-music image formats."
         else:
-            UPLOAD_DIR.mkdir(exist_ok=True)
+            request_id = uuid4().hex[:10]
+            request_dir = UPLOAD_DIR / "requests" / request_id
+            request_dir.mkdir(parents=True, exist_ok=True)
             safe_name = secure_filename(upload.filename)
-            saved_path = UPLOAD_DIR / safe_name
+            saved_path = request_dir / safe_name
             upload.save(saved_path)
 
             try:
-                parsed = parse_sheet_to_tab(saved_path, safe_name)
+                parsed = parse_sheet_to_tab(saved_path, safe_name, request_dir)
                 file_bytes = saved_path.read_bytes()
                 song = Song(
                     title=parsed["song_title"],
@@ -519,14 +619,25 @@ def index():
                 result = {
                     "title": "Easy Fingerstyle Tab (Saved)",
                     "filename": safe_name,
+                    "key_name": parsed["key_name"],
+                    "capo_suggestion": parsed["capo_suggestion"],
+                    "truncation_warning": parsed["truncation_warning"],
                     "tab": parsed["tab"],
                     "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
                 }
+            except OMRConversionError as exc:
+                db.session.rollback()
+                error = f"OMR conversion failed: {exc}"
+            except ScoreParseError as exc:
+                db.session.rollback()
+                error = str(exc)
             except Exception as exc:
                 db.session.rollback()
                 error = f"Could not generate tab from this file: {exc}"
+            finally:
+                shutil.rmtree(request_dir, ignore_errors=True)
 
-    return render_page(HOME_BODY, error=error, result=result)
+    return render_page(HOME_BODY, error=error, result=result, omr_warning=omr_warning)
 
 
 @app.route("/history", methods=["GET"])
