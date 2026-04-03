@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+import html
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -24,6 +25,7 @@ STRING_NAMES = ["E", "A", "D", "G", "B", "E"]
 SLOT_WIDTH = 3  # 16th-note slot width in monospace characters
 MAX_SLOTS = 320  # Keep output readable for large files
 OMR_TIMEOUT_SECONDS = 120
+MEASURES_PER_ROW = 4
 
 
 BASE_PAGE = """
@@ -147,6 +149,42 @@ BASE_PAGE = """
       font-size: 0.93rem;
       line-height: 1.35;
     }
+    .tab-container {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      margin-top: 0.75rem;
+    }
+    .tab-row {
+      border: 1px solid #e2dcc6;
+      border-radius: 8px;
+      background: #faf8f1;
+      padding: 0.7rem 0.8rem;
+    }
+    .tab-chords {
+      color: #2e7d32;
+      font-weight: 700;
+      white-space: pre;
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      margin-bottom: 0.35rem;
+    }
+    .tab-strings {
+      display: flex;
+      flex-direction: column;
+      gap: 0.1rem;
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: 0.95rem;
+      white-space: pre;
+    }
+    .sl {
+      line-height: 1.2;
+      color: #1f2937;
+    }
+    .sn {
+      color: #5f5a47;
+      display: inline-block;
+      width: 1.4rem;
+    }
     #processing {
       display: none;
       margin-top: 0.75rem;
@@ -198,7 +236,7 @@ HOME_BODY = """
       <div class="warning">{{ result.truncation_warning }}</div>
     {% endif %}
     <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download .txt</a></p>
-    <pre>{{ result.tab }}</pre>
+    {{ result.tab_html|safe }}
   </section>
 {% endif %}
 
@@ -245,7 +283,11 @@ ARRANGEMENT_BODY = """
 <p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
 <p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
 <p class="meta"><a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab as .txt</a></p>
-<pre>{{ row.tab_text }}</pre>
+{% if row.tab_html %}
+  {{ row.tab_html|safe }}
+{% else %}
+  <pre>{{ row.tab_text }}</pre>
+{% endif %}
 """
 
 
@@ -285,6 +327,7 @@ class Arrangement(db.Model):
     key_name = db.Column(db.String(80), nullable=False)
     capo_suggestion = db.Column(db.String(120), nullable=False, default="No suggestion")
     tab_text = db.Column(db.Text, nullable=False)
+    tab_html = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 
@@ -294,6 +337,7 @@ with app.app_context():
     db.session.execute(
         text("ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'")
     )
+    db.session.execute(text("ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS tab_html TEXT"))
     db.session.commit()
 
 
@@ -422,39 +466,45 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
 
 
 def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[int], list[tuple[int, str]], int, bool]:
-    flat = score.flatten()
+    full_flat = score.flatten()
+    parts = list(score.parts)
 
-    melody_events: list[tuple[int, int]] = []
-    bass_events: list[tuple[int, int]] = []
-    total_slots = 0
+    # Voice-aware extraction for SATB/hymn scores:
+    # melody from first part (typically soprano), bass from last part.
+    melody_source = parts[0].flatten() if parts else full_flat
+    bass_source = parts[-1].flatten() if parts else full_flat
 
-    for element in flat.notesAndRests:
-        slot = quarter_to_slot(float(element.offset))
-        total_slots = max(total_slots, slot + 1)
+    def collect_part_events(source: stream.Stream, mode: str) -> tuple[list[tuple[int, int]], int]:
+        events: list[tuple[int, int]] = []
+        max_slot = 0
+        for element in source.notesAndRests:
+            slot = quarter_to_slot(float(element.offset))
+            max_slot = max(max_slot, slot + 1)
+            if isinstance(element, note.Note):
+                events.append((slot, int(element.pitch.midi)))
+            elif isinstance(element, chord.Chord):
+                midi_values = sorted(int(p.midi) for p in element.pitches)
+                if midi_values:
+                    events.append((slot, midi_values[-1] if mode == "high" else midi_values[0]))
+        return events, max_slot
 
-        if isinstance(element, note.Note):
-            midi_value = int(element.pitch.midi)
-            melody_events.append((slot, midi_value))
-            if midi_value <= 57:
-                bass_events.append((slot, midi_value))
-        elif isinstance(element, chord.Chord):
-            midi_values = sorted(int(p.midi) for p in element.pitches)
-            if midi_values:
-                melody_events.append((slot, midi_values[-1]))
-                bass_events.append((slot, midi_values[0]))
+    melody_events, melody_max_slot = collect_part_events(melody_source, mode="high")
+    bass_events, bass_max_slot = collect_part_events(bass_source, mode="low")
+    total_slots = max(melody_max_slot, bass_max_slot)
 
     measure_slots: list[int] = []
     for measure in score.recurse().getElementsByClass(stream.Measure):
         slot = quarter_to_slot(float(measure.offset))
         if slot not in measure_slots:
             measure_slots.append(slot)
+    measure_slots.sort()
 
     chord_events: list[tuple[int, str]] = []
-    max_offset = float(flat.highestTime)
+    max_offset = float(full_flat.highestTime)
     beat = 0.0
     while beat <= max_offset:
         beat_slot = quarter_to_slot(beat)
-        vertical = flat.notes.getElementsByOffset(beat, mustBeginInSpan=True, includeEndBoundary=False)
+        vertical = full_flat.notes.getElementsByOffset(beat, mustBeginInSpan=True, includeEndBoundary=False)
         midi_values: list[int] = []
         durations: list[float] = []
         for item in vertical:
@@ -474,13 +524,29 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
 
         beat += 1.0
 
+    total_slots = max(total_slots, quarter_to_slot(max_offset) + 1)
     unclamped_slots = max(total_slots + 1, 16)
     was_truncated = unclamped_slots > MAX_SLOTS
     total_slots = min(unclamped_slots, MAX_SLOTS)
     return melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated
 
 
-def arrange_tab(score: stream.Score) -> tuple[str, bool]:
+def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]]) -> str:
+    chord_markup = html.escape(chord_chunk) if chord_chunk else ""
+    line_markup: list[str] = []
+    for string_name, line_text in row_lines:
+        line_markup.append(
+            f'<div class="sl"><span class="sn">{html.escape(string_name)}|</span>{html.escape(line_text)}</div>'
+        )
+    return (
+        '<div class="tab-row">'
+        f'<div class="tab-chords">{chord_markup}</div>'
+        f'<div class="tab-strings">{"".join(line_markup)}</div>'
+        "</div>"
+    )
+
+
+def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
     melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated = gather_events(score)
 
     lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
@@ -507,15 +573,43 @@ def arrange_tab(score: stream.Score) -> tuple[str, bool]:
 
     place_measure_dividers(lines, measure_slots)
 
-    rendered = []
     chord_line = build_chord_line(total_slots, chord_events)
-    if chord_line:
-        rendered.append(chord_line)
+    measure_starts = sorted({slot for slot in measure_slots if 0 <= slot < total_slots})
+    if not measure_starts or measure_starts[0] != 0:
+        measure_starts = [0] + measure_starts
 
-    for string_index in [5, 4, 3, 2, 1, 0]:
-        rendered.append(f"{STRING_NAMES[string_index]}|{''.join(lines[string_index])}|")
+    html_rows: list[str] = []
+    plain_rows: list[str] = []
 
-    return "\n".join(rendered), was_truncated
+    for start_idx in range(0, len(measure_starts), MEASURES_PER_ROW):
+        start_slot = measure_starts[start_idx]
+        if start_idx + MEASURES_PER_ROW < len(measure_starts):
+            end_slot = measure_starts[start_idx + MEASURES_PER_ROW]
+        else:
+            end_slot = total_slots
+        if end_slot <= start_slot:
+            end_slot = min(total_slots, start_slot + 1)
+
+        char_start = start_slot * SLOT_WIDTH
+        char_end = end_slot * SLOT_WIDTH
+        chord_chunk = chord_line[char_start:char_end].rstrip()
+
+        row_lines: list[tuple[str, str]] = []
+        plain_block: list[str] = []
+        if chord_chunk:
+            plain_block.append(chord_chunk)
+
+        for string_index in [5, 4, 3, 2, 1, 0]:
+            chunk = "".join(lines[string_index][char_start:char_end])
+            row_lines.append((STRING_NAMES[string_index], f"{chunk}|"))
+            plain_block.append(f"{STRING_NAMES[string_index]}|{chunk}|")
+
+        html_rows.append(_build_tab_row_html(chord_chunk, row_lines))
+        plain_rows.append("\n".join(plain_block))
+
+    tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
+    tab_plain = "\n\n".join(plain_rows)
+    return tab_html, tab_plain, was_truncated
 
 
 def suggest_capo(key_name: str) -> str:
@@ -573,7 +667,7 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
     except Exception:
         pass
 
-    tab, was_truncated = arrange_tab(score)
+    tab_html, tab_plain, was_truncated = arrange_tab(score)
     capo_suggestion = suggest_capo(key_name)
     header = [
         f"# {title}",
@@ -594,7 +688,8 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
             else ""
         ),
         "multi_page_warning": multi_page_warning,
-        "tab": "\n".join(header) + tab,
+        "tab_text": "\n".join(header) + tab_plain,
+        "tab_html": tab_html,
     }
 
 
@@ -637,7 +732,8 @@ def index():
                     song_id=song.id,
                     key_name=parsed["key_name"],
                     capo_suggestion=parsed["capo_suggestion"],
-                    tab_text=parsed["tab"],
+                    tab_text=parsed["tab_text"],
+                    tab_html=parsed["tab_html"],
                 )
                 db.session.add(arrangement)
                 db.session.commit()
@@ -649,7 +745,7 @@ def index():
                     "capo_suggestion": parsed["capo_suggestion"],
                     "truncation_warning": parsed["truncation_warning"],
                     "multi_page_warning": parsed["multi_page_warning"],
-                    "tab": parsed["tab"],
+                    "tab_html": parsed["tab_html"],
                     "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
                     "download_url": url_for("download_arrangement", arrangement_id=arrangement.id),
                 }
@@ -703,6 +799,7 @@ def view_arrangement(arrangement_id: int):
         db.session.query(
             Arrangement.id.label("id"),
             Arrangement.tab_text.label("tab_text"),
+            Arrangement.tab_html.label("tab_html"),
             Arrangement.key_name.label("key_name"),
             Arrangement.capo_suggestion.label("capo_suggestion"),
             Arrangement.created_at.label("created_at"),
