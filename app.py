@@ -29,7 +29,7 @@ ALLOWED_EXTENSIONS = MUSICXML_EXTENSIONS | PDF_EXTENSIONS | IMAGE_EXTENSIONS
 STANDARD_TUNING = [40, 45, 50, 55, 59, 64]
 STRING_NAMES = ["E", "A", "D", "G", "B", "E"]
 SLOT_WIDTH = 3  # 16th-note slot width in monospace characters
-MAX_SLOTS = 320  # Keep output readable for large files
+MAX_SLOTS = 960  # Allow full multi-verse hymns without truncating the song
 OMR_TIMEOUT_SECONDS = 120
 MEASURES_PER_ROW = 4
 # Approximate max monospace characters (tab columns) per rendered row before wrapping.
@@ -1444,28 +1444,68 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
     plain_rows: list[str] = []
 
     for start_slot, end_slot in row_ranges:
-        char_start = start_slot * SLOT_WIDTH
-        char_end = end_slot * SLOT_WIDTH
-        chord_chunk = chord_line[char_start:char_end].rstrip()
-        row_note = "  ".join(label for slot, label in display_section_events if start_slot <= slot < end_slot)
+        # Build measure slices for this row and drop measures that contain no
+        # frets/chords/labels so blank measures do not render as gaps.
+        row_measure_starts_in_range = [slot for slot in row_measure_starts if start_slot <= slot < end_slot]
+        if not row_measure_starts_in_range or row_measure_starts_in_range[0] != start_slot:
+            row_measure_starts_in_range = [start_slot] + row_measure_starts_in_range
 
-        row_lines: list[tuple[str, str]] = []
+        measure_ranges: list[tuple[int, int]] = []
+        for idx, measure_start in enumerate(row_measure_starts_in_range):
+            measure_end = (
+                row_measure_starts_in_range[idx + 1]
+                if idx + 1 < len(row_measure_starts_in_range)
+                else end_slot
+            )
+            if measure_end > measure_start:
+                measure_ranges.append((measure_start, measure_end))
+
+        kept_measure_ranges: list[tuple[int, int]] = []
+        for measure_start, measure_end in measure_ranges:
+            seg_char_start = measure_start * SLOT_WIDTH
+            seg_char_end = measure_end * SLOT_WIDTH
+            seg_has_frets = False
+            for string_index in [5, 4, 3, 2, 1, 0]:
+                seg = "".join(lines[string_index][seg_char_start:seg_char_end])
+                if any(ch.isdigit() for ch in seg):
+                    seg_has_frets = True
+                    break
+            seg_chord = chord_line[seg_char_start:seg_char_end].strip()
+            seg_note = any(measure_start <= slot < measure_end for slot, _ in display_section_events)
+            if seg_has_frets or seg_chord or seg_note:
+                kept_measure_ranges.append((measure_start, measure_end))
+
+        if not kept_measure_ranges:
+            continue
+
+        chord_parts: list[str] = []
+        row_note_labels: list[str] = []
+        for measure_start, measure_end in kept_measure_ranges:
+            seg_char_start = measure_start * SLOT_WIDTH
+            seg_char_end = measure_end * SLOT_WIDTH
+            chord_parts.append(chord_line[seg_char_start:seg_char_end])
+            row_note_labels.extend(
+                label for slot, label in display_section_events if measure_start <= slot < measure_end
+            )
+
+        chord_chunk = "".join(chord_parts).rstrip()
+        row_note = "  ".join(row_note_labels)
         plain_block: list[str] = []
         if row_note:
             plain_block.append(row_note)
         if chord_chunk:
             plain_block.append(chord_chunk)
 
-        row_has_frets = False
+        row_lines: list[tuple[str, str]] = []
         for string_index in [5, 4, 3, 2, 1, 0]:
-            chunk = "".join(lines[string_index][char_start:char_end])
-            if any(ch.isdigit() for ch in chunk):
-                row_has_frets = True
+            kept_chunks: list[str] = []
+            for measure_start, measure_end in kept_measure_ranges:
+                seg_char_start = measure_start * SLOT_WIDTH
+                seg_char_end = measure_end * SLOT_WIDTH
+                kept_chunks.append("".join(lines[string_index][seg_char_start:seg_char_end]))
+            chunk = "".join(kept_chunks)
             row_lines.append((STRING_NAMES[string_index], f"{chunk}|"))
             plain_block.append(f"{STRING_NAMES[string_index]}|{chunk}|")
-
-        if not row_has_frets and not chord_chunk and not row_note:
-            continue
 
         html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note))
         plain_rows.append("\n".join(plain_block))
