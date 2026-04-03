@@ -595,8 +595,17 @@ def gather_events(
         max_slot = 0
         for element in source.recurse().notesAndRests:
             if voice_filter is not None:
+                voice_id: Optional[str] = None
                 parent_voice = element.getContextByClass(stream.Voice)
-                if parent_voice is None or str(parent_voice.id) != voice_filter:
+                if parent_voice is not None and parent_voice.id is not None:
+                    voice_id = str(parent_voice.id)
+                else:
+                    raw_voice = getattr(element, "voice", None)
+                    if raw_voice is not None:
+                        voice_id = str(raw_voice)
+                # If voice metadata is present, enforce the filter.
+                # If it is missing, keep the note to avoid dropping most melody events.
+                if voice_id is not None and voice_id != voice_filter:
                     continue
 
             slot = quarter_to_slot(float(element.getOffsetInHierarchy(source)))
@@ -611,6 +620,14 @@ def gather_events(
 
     melody_events, melody_max_slot = collect_part_events(melody_source, mode="high", voice_filter=melody_voice)
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
+
+    # Fallback: if voice-filtering produces sparse melody (common in imperfect OMR),
+    # fall back to unfiltered first-part melody so the line is still playable.
+    if parts and len(melody_events) < 8:
+        fallback_melody, fallback_max = collect_part_events(parts[0], mode="high", voice_filter=None)
+        if len(fallback_melody) > len(melody_events):
+            melody_events, melody_max_slot = fallback_melody, fallback_max
+
     total_slots = max(melody_max_slot, bass_max_slot)
 
     measure_slots: list[int] = []
@@ -621,10 +638,27 @@ def gather_events(
     measure_slots.sort()
 
     chord_events: list[tuple[int, str]] = []
+    seen_chord_slots: set[int] = set()
+
+    # Prefer explicit MusicXML chord symbols when available.
+    for symbol in score.recurse().getElementsByClass(harmony.ChordSymbol):
+        label = str(getattr(symbol, "figure", "") or "").strip()
+        if not label:
+            continue
+        slot = quarter_to_slot(float(symbol.getOffsetInHierarchy(score)))
+        if slot in seen_chord_slots:
+            continue
+        seen_chord_slots.add(slot)
+        chord_events.append((slot, label))
+
     max_offset = float(full_flat.highestTime)
     beat = 0.0
+    last_inferred_label = ""
     while beat <= max_offset:
         beat_slot = quarter_to_slot(beat)
+        if beat_slot in seen_chord_slots:
+            beat += 1.0
+            continue
         vertical = full_flat.notes.getElementsByOffset(beat, mustBeginInSpan=True, includeEndBoundary=False)
         midi_values: list[int] = []
         durations: list[float] = []
@@ -636,12 +670,13 @@ def gather_events(
                 midi_values.extend(int(p.midi) for p in item.pitches)
                 durations.append(float(item.quarterLength))
 
-        if len(midi_values) >= 3 and max(durations or [0.0]) >= 1.0:
+        if len(midi_values) >= 2 and max(durations or [0.0]) >= 0.5:
             guessed = chord.Chord([pitch.Pitch(midi=v) for v in sorted(set(midi_values))])
             symbol = harmony.chordSymbolFromChord(guessed)
             label = symbol.figure if symbol and symbol.figure else ""
-            if label:
+            if label and label != last_inferred_label:
                 chord_events.append((beat_slot, label))
+                last_inferred_label = label
 
         beat += 1.0
 
