@@ -3,7 +3,10 @@ import shutil
 import subprocess
 import html
 import tempfile
+import re
+from bisect import bisect_right
 from dataclasses import dataclass
+from enum import Enum
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
@@ -37,6 +40,12 @@ KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
 GUITAR_MIN_MIDI = 40
 GUITAR_MAX_MIDI = 79
+
+
+class TabDifficulty(str, Enum):
+    EASY = "easy"
+    STANDARD = "standard"
+    COMPLETE = "complete"
 
 
 BASE_PAGE = """
@@ -376,6 +385,12 @@ HOME_BODY = """
 
 <form method="post" enctype="multipart/form-data" id="upload-form">
   <input type="file" name="music_file" accept=".musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.webp" required>
+  <label for="difficulty"><strong>Mode:</strong></label>
+  <select id="difficulty" name="difficulty">
+    {% for option in difficulty_options %}
+      <option value="{{ option.value }}" {% if option.value == selected_difficulty %}selected{% endif %}>{{ option.label }}</option>
+    {% endfor %}
+  </select>
   <button type="submit">Generate Tab</button>
 </form>
 <div id="processing">Processing upload... OMR on PDFs/images can take up to a minute.</div>
@@ -388,6 +403,7 @@ HOME_BODY = """
   <section class="result">
     <h2>{{ result.title }}</h2>
     <p class="meta"><strong>Uploaded file:</strong> {{ result.filename }}</p>
+    <p class="meta"><strong>Mode:</strong> {{ result.difficulty_label }}</p>
     <p class="meta"><strong>Estimated key:</strong> {{ result.key_name }} | <strong>Capo suggestion:</strong> {{ result.capo_suggestion }}</p>
     {% if result.multi_page_warning %}
       <div class="warning">{{ result.multi_page_warning }}</div>
@@ -445,6 +461,7 @@ ARRANGEMENT_BODY = """
 </div>
 <p class="meta"><strong>Original file:</strong> {{ row.original_filename }}</p>
 <p class="meta"><strong>Estimated key:</strong> {{ row.key_name }}</p>
+<p class="meta"><strong>Mode:</strong> {{ row.difficulty_label }}</p>
 <p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
 <p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
 <p class="meta"><a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab as .txt</a></p>
@@ -453,6 +470,12 @@ ARRANGEMENT_BODY = """
   <select id="target_key" name="target_key">
     {% for option in key_options %}
       <option value="{{ option }}" {% if option == selected_key %}selected{% endif %}>{{ option }}</option>
+    {% endfor %}
+  </select>
+  <label for="target_difficulty"><strong>Mode:</strong></label>
+  <select id="target_difficulty" name="target_difficulty">
+    {% for option in difficulty_options %}
+      <option value="{{ option.value }}" {% if option.value == selected_difficulty %}selected{% endif %}>{{ option.label }}</option>
     {% endfor %}
   </select>
   <button type="submit" name="transpose_action" value="preview">Update Tab</button>
@@ -511,6 +534,7 @@ class Arrangement(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     song_id = db.Column(db.Integer, db.ForeignKey("songs.id", ondelete="CASCADE"), nullable=False)
     key_name = db.Column(db.String(80), nullable=False)
+    difficulty = db.Column(db.String(20), nullable=False, default=TabDifficulty.STANDARD.value)
     capo_suggestion = db.Column(db.String(120), nullable=False, default="No suggestion")
     tab_text = db.Column(db.Text, nullable=False)
     tab_html = db.Column(db.Text, nullable=True)
@@ -521,6 +545,8 @@ class Arrangement(db.Model):
 class ScoreEvents:
     melody_events: list[tuple[int, int]]
     bass_events: list[tuple[int, int]]
+    inner_events: list[tuple[int, int]]
+    played_chord_events: list[tuple[int, list[int]]]
     measure_slots: list[int]
     chord_events: list[tuple[int, str]]
     section_events: list[tuple[int, str]]
@@ -550,6 +576,10 @@ with app.app_context():
         "ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS tab_html TEXT",
         "ALTER TABLE arrangements ADD COLUMN tab_html TEXT",
     )
+    _safe_add_column(
+        f"ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS difficulty VARCHAR(20) NOT NULL DEFAULT '{TabDifficulty.STANDARD.value}'",
+        f"ALTER TABLE arrangements ADD COLUMN difficulty VARCHAR(20) NOT NULL DEFAULT '{TabDifficulty.STANDARD.value}'",
+    )
     db.session.commit()
 
 
@@ -559,6 +589,26 @@ class OMRConversionError(Exception):
 
 class ScoreParseError(Exception):
     pass
+
+
+def parse_difficulty(value: Optional[str]) -> TabDifficulty:
+    raw = (value or "").strip().lower()
+    for option in TabDifficulty:
+        if option.value == raw:
+            return option
+    return TabDifficulty.STANDARD
+
+
+def difficulty_label(difficulty: TabDifficulty) -> str:
+    if difficulty == TabDifficulty.EASY:
+        return "Make Easier"
+    if difficulty == TabDifficulty.COMPLETE:
+        return "Make More Complete"
+    return "Standard"
+
+
+def difficulty_options() -> list[dict[str, str]]:
+    return [{"value": d.value, "label": difficulty_label(d)} for d in TabDifficulty]
 
 
 def render_page(body_template: str, page_title: str = "GuitarTabber", **context: object) -> str:
@@ -695,7 +745,38 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
     return "".join(line).rstrip()
 
 
-def gather_events(score: stream.Score) -> ScoreEvents:
+def simplify_chord_label(label: str) -> str:
+    cleaned = re.sub(r"\([^)]*\)", "", label or "").strip()
+    lowered = cleaned.lower()
+    if "dim" in lowered:
+        m = re.match(r"^([A-G][b#]?)(.*)$", cleaned)
+        return f"{m.group(1)}dim" if m else cleaned
+    if "aug" in lowered or "+" in cleaned:
+        m = re.match(r"^([A-G][b#]?)(.*)$", cleaned)
+        return f"{m.group(1)}aug" if m else cleaned
+    m = re.match(r"^([A-G][b#]?)(m?)(.*)$", cleaned)
+    if not m:
+        return cleaned
+    tonic, minorish, _ = m.groups()
+    return f"{tonic}{'m' if minorish == 'm' else ''}"
+
+
+def keep_easy_melody_slot(slot: int, measure_starts: list[int], first_ts: Optional[meter.TimeSignature]) -> bool:
+    if not measure_starts:
+        return True
+    measure_index = bisect_right(measure_starts, slot) - 1
+    measure_start = measure_starts[max(0, measure_index)]
+    in_measure = max(0, slot - measure_start)
+    num = getattr(first_ts, "numerator", None) if first_ts else None
+    den = getattr(first_ts, "denominator", None) if first_ts else None
+    if num == 4 and den == 4:
+        return in_measure in {0, 8}
+    if den == 4:
+        return in_measure == 0
+    return in_measure == 0
+
+
+def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.STANDARD) -> ScoreEvents:
     full_flat = score.flatten()
     parts = list(score.parts)
 
@@ -777,6 +858,8 @@ def gather_events(score: stream.Score) -> ScoreEvents:
 
     chord_events: list[tuple[int, str]] = []
     seen_chord_slots: set[int] = set()
+    played_chord_events: list[tuple[int, list[int]]] = []
+    seen_played_slots: set[int] = set()
 
     # Prefer explicit MusicXML chord symbols when available.
     for symbol in score.recurse().getElementsByClass(harmony.ChordSymbol):
@@ -788,6 +871,26 @@ def gather_events(score: stream.Score) -> ScoreEvents:
             continue
         seen_chord_slots.add(slot)
         chord_events.append((slot, label))
+
+    # Capture explicit written chord attacks (especially in lower staves) so
+    # they can be rendered as actual tab notes, not only labels.
+    for chord_obj in bass_source.flatten().recurse().getElementsByClass(chord.Chord):
+        slot = quarter_to_slot(float(chord_obj.offset))
+        midi_values = sorted({int(p.midi) for p in chord_obj.pitches})
+        if len(midi_values) < 2:
+            continue
+        if slot not in seen_played_slots:
+            seen_played_slots.add(slot)
+            played_chord_events.append((slot, midi_values))
+        if slot not in seen_chord_slots:
+            try:
+                symbol = harmony.chordSymbolFromChord(chord_obj)
+                inferred_label = symbol.figure if symbol and symbol.figure else ""
+            except Exception:
+                inferred_label = ""
+            if inferred_label:
+                seen_chord_slots.add(slot)
+                chord_events.append((slot, inferred_label))
 
     max_offset = float(full_flat.highestTime)
     beat_step = 1.0
@@ -826,7 +929,8 @@ def gather_events(score: stream.Score) -> ScoreEvents:
                 midi_values.extend(int(p.midi) for p in item.pitches)
                 durations.append(float(item.quarterLength))
 
-        if len(midi_values) >= 2 and max(durations or [0.0]) >= 0.5:
+        min_duration = 0.25 if difficulty == TabDifficulty.COMPLETE else 0.5
+        if len(midi_values) >= 2 and max(durations or [0.0]) >= min_duration:
             guessed = chord.Chord([pitch.Pitch(midi=v) for v in sorted(set(midi_values))])
             symbol = harmony.chordSymbolFromChord(guessed)
             label = symbol.figure if symbol and symbol.figure else ""
@@ -883,10 +987,51 @@ def gather_events(score: stream.Score) -> ScoreEvents:
         bar_slots = max(1, quarter_to_slot(bar_quarters))
         measure_slots = list(range(0, total_slots, bar_slots))
 
+    if difficulty == TabDifficulty.EASY:
+        melody_events = [
+            (slot, midi_value)
+            for slot, midi_value in melody_events
+            if keep_easy_melody_slot(slot, measure_slots, first_ts)
+        ]
+        chord_events = [(slot, simplify_chord_label(label)) for slot, label in chord_events]
+        simplified_played: list[tuple[int, list[int]]] = []
+        for slot, midi_values in played_chord_events:
+            # Keep easier dyads (root + upper chord tone) for first-position feel.
+            if len(midi_values) >= 2:
+                simplified_played.append((slot, [midi_values[0], midi_values[-1]]))
+            else:
+                simplified_played.append((slot, midi_values))
+        played_chord_events = simplified_played
+
+    inner_events: list[tuple[int, int]] = []
+    if difficulty == TabDifficulty.COMPLETE and parts:
+        inner_sources: list[tuple[stream.Stream, Optional[str], str]] = []
+        inner_sources.append((parts[0], choose_voice(parts[0], "2"), "high"))
+        if len(parts) > 1:
+            inner_sources.append((parts[-1], choose_voice(parts[-1], "1"), "low"))
+        for mid in parts[1:-1]:
+            inner_sources.append((mid, None, "high"))
+
+        by_slot: dict[int, list[int]] = {}
+        for src, voice_id, mode in inner_sources:
+            events, _ = collect_part_events(src, mode=mode, voice_filter=voice_id)
+            for slot, midi_value in events:
+                if slot >= total_slots:
+                    continue
+                by_slot.setdefault(slot, []).append(midi_value)
+        for slot in sorted(by_slot):
+            values = sorted(by_slot[slot])
+            if not values:
+                continue
+            inner_events.append((slot, values[len(values) // 2]))
+
     section_events.sort(key=lambda item: item[0])
+    played_chord_events.sort(key=lambda item: item[0])
     return ScoreEvents(
         melody_events=melody_events,
         bass_events=bass_events,
+        inner_events=inner_events,
+        played_chord_events=played_chord_events,
         measure_slots=measure_slots,
         chord_events=chord_events,
         section_events=section_events,
@@ -912,38 +1057,69 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_
     )
 
 
-def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
-    events = gather_events(score)
+def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.STANDARD) -> tuple[str, str, bool]:
+    events = gather_events(score, difficulty=difficulty)
     lines = {idx: ["-"] * (events.total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
+    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 14
+    bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 10)
+    inner_max_fret = 9 if difficulty == TabDifficulty.EASY else 14
+    max_span = 3 if difficulty == TabDifficulty.EASY else (7 if difficulty == TabDifficulty.COMPLETE else MAX_FRETTED_SPAN)
+
+    def try_place_midi_at_slot(
+        slot: int,
+        midi_value: int,
+        preferred_strings: list[int],
+        max_fret: int,
+    ) -> bool:
+        candidates = find_positions(midi_value, preferred_strings=preferred_strings, max_fret=max_fret)
+        for string_index, fret in candidates:
+            if not slot_is_free(lines[string_index], slot):
+                continue
+            existing_frets = slot_fretted_notes.get(slot, [])
+            if not can_place_fret_at_slot(existing_frets, fret, max_fretted_span=max_span):
+                continue
+            place_token(lines[string_index], slot, str(fret))
+            slot_fretted_notes.setdefault(slot, []).append(fret)
+            return True
+        return False
 
     for slot, midi_value in events.melody_events:
         if slot >= events.total_slots:
             continue
-        candidates = find_positions(midi_value, preferred_strings=[5, 4, 3, 2], max_fret=14)
-        for string_index, fret in candidates:
-            if not slot_is_free(lines[string_index], slot):
-                continue
-            existing_frets = slot_fretted_notes.get(slot, [])
-            if not can_place_fret_at_slot(existing_frets, fret):
-                continue
-            place_token(lines[string_index], slot, str(fret))
-            slot_fretted_notes.setdefault(slot, []).append(fret)
-            break
+        try_place_midi_at_slot(slot, midi_value, preferred_strings=[5, 4, 3, 2], max_fret=melody_max_fret)
 
     for slot, midi_value in events.bass_events:
         if slot >= events.total_slots:
             continue
-        candidates = find_positions(midi_value, preferred_strings=[0, 1, 2, 3], max_fret=10)
-        for string_index, fret in candidates:
-            if not slot_is_free(lines[string_index], slot):
+        try_place_midi_at_slot(slot, midi_value, preferred_strings=[0, 1, 2, 3], max_fret=bass_max_fret)
+
+    # Render explicit played chord stacks from score events so chord attacks
+    # appear as actual tab notes (not just text labels above the stave).
+    chord_strings = [0, 1, 2, 3, 4] if difficulty != TabDifficulty.COMPLETE else [0, 1, 2, 3, 4, 5]
+    for slot, midi_values in events.played_chord_events:
+        if slot >= events.total_slots:
+            continue
+        for midi_value in sorted(set(midi_values)):
+            try_place_midi_at_slot(slot, midi_value, preferred_strings=chord_strings, max_fret=bass_max_fret)
+
+    if difficulty == TabDifficulty.COMPLETE:
+        for slot, midi_value in events.inner_events:
+            if slot >= events.total_slots:
                 continue
-            existing_frets = slot_fretted_notes.get(slot, [])
-            if not can_place_fret_at_slot(existing_frets, fret):
+            try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret)
+
+        # Try filling implied chord tones at chord-change beats to make fuller voicings.
+        for slot, chord_label in events.chord_events:
+            if slot >= events.total_slots:
                 continue
-            place_token(lines[string_index], slot, str(fret))
-            slot_fretted_notes.setdefault(slot, []).append(fret)
-            break
+            try:
+                symbol = harmony.ChordSymbol(chord_label)
+                chord_midis = [int(p.midi) for p in symbol.pitches]
+            except Exception:
+                continue
+            for midi_value in chord_midis[:4]:
+                try_place_midi_at_slot(slot, midi_value, preferred_strings=[2, 3, 1, 4, 0, 5], max_fret=inner_max_fret)
 
     place_measure_dividers(lines, events.measure_slots)
 
@@ -1036,6 +1212,27 @@ def suggest_capo(key_name: str) -> str:
     return "No strong capo suggestion"
 
 
+def capo_play_key_from_suggestion(capo_suggestion: str, mode: str) -> Optional[str]:
+    marker = "(play in "
+    if marker not in capo_suggestion:
+        return None
+    start = capo_suggestion.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = capo_suggestion.find(")", start)
+    if end < 0:
+        return None
+    play_key = capo_suggestion[start:end].strip()
+    if not play_key:
+        return None
+    if mode == "minor":
+        tonic = play_key[:-1] if play_key.endswith("m") else play_key
+        return f"{tonic} minor"
+    tonic = play_key[:-1] if play_key.endswith("m") else play_key
+    return f"{tonic} major"
+
+
 def build_key_options() -> list[str]:
     tonic_order = ["C", "G", "D", "A", "E", "B", "F#", "C#", "Ab", "Eb", "Bb", "F"]
     options: list[str] = []
@@ -1065,6 +1262,7 @@ def render_score_to_tab_payload(
     title: str,
     source_label: str,
     forced_key_name: Optional[str] = None,
+    difficulty: TabDifficulty = TabDifficulty.STANDARD,
 ) -> dict[str, str]:
     key_name = forced_key_name or "Unknown"
     if forced_key_name is None:
@@ -1074,17 +1272,29 @@ def render_score_to_tab_payload(
         except Exception:
             pass
 
-    tab_html, tab_plain, was_truncated = arrange_tab(score)
+    capo_suggestion = suggest_capo(key_name)
+    if difficulty == TabDifficulty.EASY:
+        parsed_key = parse_key_name(key_name)
+        if parsed_key is not None:
+            _, mode = parsed_key
+            play_key = capo_play_key_from_suggestion(capo_suggestion, mode)
+            if play_key and play_key != key_name:
+                score = transpose_score_between_keys(score, key_name, play_key)
+                key_name = play_key
+
+    tab_html, tab_plain, was_truncated = arrange_tab(score, difficulty=difficulty)
     header = [
         f"# {title}",
         f"# Source file: {source_label}",
         f"# Estimated key: {key_name}",
+        f"# Mode: {difficulty_label(difficulty)}",
         "# Layout: basic melody (high strings) + bass (low strings)",
         "",
     ]
     return {
         "key_name": key_name,
-        "capo_suggestion": suggest_capo(key_name),
+        "capo_suggestion": capo_suggestion,
+        "difficulty": difficulty.value,
         "tab_text": "\n".join(header) + tab_plain,
         "tab_html": tab_html,
         "truncation_warning": (
@@ -1159,7 +1369,12 @@ def transpose_score_between_keys(score: stream.Score, source_key_name: str, targ
     return score.transpose(best, inPlace=False)
 
 
-def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict[str, Any]:
+def parse_sheet_to_tab(
+    saved_path: Path,
+    safe_name: str,
+    work_dir: Path,
+    difficulty: TabDifficulty = TabDifficulty.STANDARD,
+) -> dict[str, Any]:
     parse_paths: list[Path] = [saved_path]
     source_label = safe_name
     multi_page_warning = ""
@@ -1182,7 +1397,7 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
     if score.metadata and score.metadata.title:
         title = str(score.metadata.title)
 
-    rendered = render_score_to_tab_payload(score, title, source_label)
+    rendered = render_score_to_tab_payload(score, title, source_label, difficulty=difficulty)
 
     ext = parse_paths[0].suffix.lower()
     output_mime_type = "application/vnd.recordare.musicxml+xml"
@@ -1199,6 +1414,7 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
         "multi_page_warning": multi_page_warning,
         "tab_text": rendered["tab_text"],
         "tab_html": rendered["tab_html"],
+        "difficulty": rendered["difficulty"],
     }
 
 
@@ -1206,12 +1422,14 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
 def index():
     error = None
     result = None
+    selected_difficulty = TabDifficulty.STANDARD
     omr_warning = None
     if not is_omr_available():
         omr_warning = "OMR is currently unavailable on this server. PDF/image uploads may fail; MusicXML uploads still work."
 
     if request.method == "POST":
         upload = request.files.get("music_file")
+        selected_difficulty = parse_difficulty(request.form.get("difficulty"))
 
         if upload is None or not upload.filename:
             error = "Please choose a MusicXML, PDF, or image file to upload."
@@ -1226,7 +1444,7 @@ def index():
             upload.save(saved_path)
 
             try:
-                parsed = parse_sheet_to_tab(saved_path, safe_name, request_dir)
+                parsed = parse_sheet_to_tab(saved_path, safe_name, request_dir, difficulty=selected_difficulty)
                 file_bytes = parsed["musicxml_bytes"]
                 song = Song(
                     title=parsed["song_title"],
@@ -1240,6 +1458,7 @@ def index():
                 arrangement = Arrangement(
                     song_id=song.id,
                     key_name=parsed["key_name"],
+                    difficulty=parsed["difficulty"],
                     capo_suggestion=parsed["capo_suggestion"],
                     tab_text=parsed["tab_text"],
                     tab_html=parsed["tab_html"],
@@ -1248,9 +1467,10 @@ def index():
                 db.session.commit()
 
                 result = {
-                    "title": "Easy Fingerstyle Tab (Saved)",
+                    "title": f"{difficulty_label(selected_difficulty)} Tab (Saved)",
                     "filename": safe_name,
                     "key_name": parsed["key_name"],
+                    "difficulty_label": difficulty_label(selected_difficulty),
                     "capo_suggestion": parsed["capo_suggestion"],
                     "truncation_warning": parsed["truncation_warning"],
                     "multi_page_warning": parsed["multi_page_warning"],
@@ -1270,7 +1490,14 @@ def index():
             finally:
                 shutil.rmtree(request_dir, ignore_errors=True)
 
-    return render_page(HOME_BODY, error=error, result=result, omr_warning=omr_warning)
+    return render_page(
+        HOME_BODY,
+        error=error,
+        result=result,
+        omr_warning=omr_warning,
+        difficulty_options=difficulty_options(),
+        selected_difficulty=selected_difficulty.value,
+    )
 
 
 @app.route("/history", methods=["GET"])
@@ -1311,6 +1538,7 @@ def view_arrangement(arrangement_id: int):
             Arrangement.tab_text.label("tab_text"),
             Arrangement.tab_html.label("tab_html"),
             Arrangement.key_name.label("key_name"),
+            Arrangement.difficulty.label("difficulty"),
             Arrangement.capo_suggestion.label("capo_suggestion"),
             Arrangement.created_at.label("created_at"),
             Song.title.label("song_title"),
@@ -1326,6 +1554,7 @@ def view_arrangement(arrangement_id: int):
 
     key_options = build_key_options()
     selected_key = row.key_name if row.key_name in key_options else key_options[0]
+    selected_difficulty = parse_difficulty(row.difficulty)
     transpose_error = None
     transpose_note = None
     created_label = row.created_at.strftime("%Y-%m-%d %H:%M") if row.created_at else ""
@@ -1335,6 +1564,8 @@ def view_arrangement(arrangement_id: int):
         "tab_text": row.tab_text,
         "tab_html": row.tab_html,
         "key_name": row.key_name,
+        "difficulty": selected_difficulty.value,
+        "difficulty_label": difficulty_label(selected_difficulty),
         "capo_suggestion": row.capo_suggestion,
         "created_at": created_label,
         "song_title": row.song_title,
@@ -1343,6 +1574,7 @@ def view_arrangement(arrangement_id: int):
 
     if request.method == "POST":
         selected_key = (request.form.get("target_key") or "").strip()
+        selected_difficulty = parse_difficulty(request.form.get("target_difficulty"))
         transpose_action = (request.form.get("transpose_action") or "preview").strip().lower()
         if selected_key not in key_options:
             transpose_error = "Please choose a valid target key."
@@ -1364,15 +1596,19 @@ def view_arrangement(arrangement_id: int):
                     row.song_title,
                     source_label,
                     forced_key_name=selected_key,
+                    difficulty=selected_difficulty,
                 )
                 display["tab_text"] = rendered["tab_text"]
                 display["tab_html"] = rendered["tab_html"]
                 display["key_name"] = rendered["key_name"]
+                display["difficulty"] = rendered["difficulty"]
+                display["difficulty_label"] = difficulty_label(selected_difficulty)
                 display["capo_suggestion"] = rendered["capo_suggestion"]
                 if transpose_action == "save":
                     new_arrangement = Arrangement(
                         song_id=row.song_id,
                         key_name=rendered["key_name"],
+                        difficulty=rendered["difficulty"],
                         capo_suggestion=rendered["capo_suggestion"],
                         tab_text=rendered["tab_text"],
                         tab_html=rendered["tab_html"],
@@ -1380,7 +1616,10 @@ def view_arrangement(arrangement_id: int):
                     db.session.add(new_arrangement)
                     db.session.commit()
                     return redirect(url_for("view_arrangement", arrangement_id=new_arrangement.id))
-                transpose_note = f"Showing transposed preview in {selected_key}. Saved arrangement remains unchanged."
+                transpose_note = (
+                    f"Showing transposed preview in {selected_key} ({difficulty_label(selected_difficulty)} mode). "
+                    "Saved arrangement remains unchanged."
+                )
                 if rendered["truncation_warning"]:
                     transpose_note = f"{transpose_note} {rendered['truncation_warning']}"
             except Exception as exc:
@@ -1393,6 +1632,8 @@ def view_arrangement(arrangement_id: int):
         row=SimpleNamespace(**display),
         key_options=key_options,
         selected_key=selected_key,
+        difficulty_options=difficulty_options(),
+        selected_difficulty=selected_difficulty.value,
         transpose_error=transpose_error,
         transpose_note=transpose_note,
     )

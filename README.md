@@ -25,6 +25,10 @@ Open `http://127.0.0.1:5000` and upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, or 
 - Section/repeat markers (when detected in MusicXML)
 - Basic playability sanity filter (limits extreme simultaneous fret spans)
 - Key estimation + capo suggestion
+- Difficulty modes:
+  - `Make Easier` (auto-capo play key, lower fret span, first-position bias, simplified chord labels, thinner melody density)
+  - `Standard`
+  - `Make More Complete` (adds inner voices and fuller harmonic placement)
 - Arrangement permalink/history + `.txt` download
 - Transpose preview and **Save As New Arrangement**
 - Tab display controls:
