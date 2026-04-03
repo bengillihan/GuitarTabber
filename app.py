@@ -22,7 +22,7 @@ from werkzeug.utils import secure_filename
 UPLOAD_DIR = Path("uploads")
 MUSICXML_EXTENSIONS = {"musicxml", "xml", "mxl"}
 PDF_EXTENSIONS = {"pdf"}
-IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"}
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "heic", "heif"}
 ALLOWED_EXTENSIONS = MUSICXML_EXTENSIONS | PDF_EXTENSIONS | IMAGE_EXTENSIONS
 
 # MIDI note numbers for standard tuning, low E to high E.
@@ -671,6 +671,77 @@ def run_audiveris_export(audiveris_bin: str, output_dir: Path, source_path: Path
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
+def _imagemagick_bin() -> Optional[str]:
+    """Return the ImageMagick binary name available on this system, or None."""
+    for candidate in ("magick", "convert"):
+        if shutil.which(candidate):
+            return candidate
+    return None
+
+
+def preprocess_image_for_omr(source_path: Path, work_dir: Path) -> Path:
+    """
+    Return a preprocessed PNG suitable for Audiveris OMR.
+
+    Steps applied when ImageMagick is available:
+      - Convert HEIC/HEIF to PNG (Audiveris cannot read HEIC directly)
+      - Convert to grayscale
+      - Apply auto-level contrast stretch so faint ink becomes crisper
+      - Sharpen slightly to help note-head detection
+
+    Falls back to the original file if ImageMagick is unavailable or conversion
+    fails (Audiveris will still attempt to process the original).
+    """
+    ext = file_extension(source_path.name)
+    needs_conversion = ext in {"heic", "heif"}
+    im_bin = _imagemagick_bin()
+
+    if im_bin is None and not needs_conversion:
+        return source_path  # nothing to do, no tool available
+
+    out_dir = work_dir / "omr_preprocessed"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{source_path.stem}_omr.png"
+
+    if im_bin is None:
+        # ImageMagick absent but file is already a raster format — pass through.
+        return source_path
+
+    # Build ImageMagick command:
+    #   -colorspace Gray   → greyscale (reduces noise, speeds OMR)
+    #   -normalize         → stretch contrast to full range
+    #   -sharpen 0x1       → mild unsharp to crisp note heads
+    #   -density 300       → embed 300 dpi hint so Audiveris scales correctly
+    #   -type Grayscale    → ensure output has no colour channels
+    if im_bin == "magick":
+        cmd = [im_bin, "convert", str(source_path)]
+    else:
+        cmd = [im_bin, str(source_path)]
+    cmd += [
+        "-colorspace", "Gray",
+        "-normalize",
+        "-sharpen", "0x1",
+        "-density", "300",
+        "-type", "Grayscale",
+        str(out_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        if result.returncode == 0 and out_path.exists():
+            return out_path
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Fallback: if ImageMagick failed, at least return original for non-HEIC files.
+    if not needs_conversion:
+        return source_path
+
+    raise OMRConversionError(
+        "HEIC/HEIF images require ImageMagick to convert. "
+        "Install it with: brew install imagemagick"
+    )
+
+
 def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path]:
     gs_bin = shutil.which("gs")
     if gs_bin is None:
@@ -699,6 +770,12 @@ def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path
 def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
     """Convert PDF/image sheet music to MusicXML using Audiveris."""
     audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
+
+    # Preprocess camera/phone images before handing to Audiveris.
+    # This converts HEIC → PNG and applies contrast enhancement for all images.
+    if file_extension(source_path.name) in IMAGE_EXTENSIONS:
+        source_path = preprocess_image_for_omr(source_path, work_dir)
+
     output_dir = work_dir / "omr_exports"
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1083,12 +1160,20 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
     comp_source: Optional[stream.Stream] = parts[1] if len(parts) >= 3 else None
 
-    # In Standard/Complete, prefer "highest note per slot" from top staff to
-    # avoid OMR voice-ID mistakes in SATB shared-stem notation.
+    # In Standard/Complete, use "highest note per slot" from top staff as a
+    # fallback when voice-ID filtering is sparse — but prefer the voice-filtered
+    # soprano events when they cover ≥ 75% of the top-staff slots, since voice 1
+    # is more accurate than a brute-force pitch max (which can mix in alto notes
+    # when the soprano holds while the alto moves).
     if parts and difficulty != TabDifficulty.EASY:
         top_staff_events, top_staff_max_slot = collect_highest_per_slot(parts[0])
-        if top_staff_events:
+        voice_coverage = len(melody_events) / max(1, len(top_staff_events))
+        if voice_coverage < 0.75 and top_staff_events:
+            # Voice filtering produced too few notes — fall back to highest per slot.
             melody_events = top_staff_events
+            melody_max_slot = max(melody_max_slot, top_staff_max_slot)
+        elif top_staff_events:
+            # Keep voice-filtered events but extend the range to the full top-staff span.
             melody_max_slot = max(melody_max_slot, top_staff_max_slot)
         # Bass voice IDs from OMR are often unreliable; keep lowest note per slot.
         low_staff_events, low_staff_max_slot = collect_lowest_per_slot(bass_source)
@@ -1514,7 +1599,7 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
     lines = {idx: ["-"] * (display_total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
     last_melody_pos: Optional[tuple[int, int]] = None
-    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 14
+    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 17
     bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 10)
     inner_max_fret = 9 if difficulty == TabDifficulty.EASY else 14
     max_span = 3 if difficulty == TabDifficulty.EASY else (7 if difficulty == TabDifficulty.COMPLETE else MAX_FRETTED_SPAN)
