@@ -62,6 +62,7 @@ BASE_PAGE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ page_title }}</title>
+  <link rel="icon" type="image/svg+xml" href='data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"%3E%3Ctext y="50" font-size="50"%3E%F0%9F%8E%B8%3C/text%3E%3C/svg%3E'>
   <style>
     body {
       margin: 0;
@@ -815,21 +816,6 @@ def extract_chord_token(raw_value: str) -> Optional[str]:
     return f"{root}{rest}"
 
 
-def keep_easy_melody_slot(slot: int, measure_starts: list[int], first_ts: Optional[meter.TimeSignature]) -> bool:
-    if not measure_starts:
-        return True
-    measure_index = bisect_right(measure_starts, slot) - 1
-    measure_start = measure_starts[max(0, measure_index)]
-    in_measure = max(0, slot - measure_start)
-    num = getattr(first_ts, "numerator", None) if first_ts else None
-    den = getattr(first_ts, "denominator", None) if first_ts else None
-    if num == 4 and den == 4:
-        return in_measure in {0, 8}
-    if den == 4:
-        return in_measure == 0
-    return in_measure == 0
-
-
 def keep_easy_chord_slot(slot: int, measure_starts: list[int], first_ts: Optional[meter.TimeSignature]) -> bool:
     if not measure_starts:
         return True
@@ -1219,11 +1205,6 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     measure_slots = sorted(set(measure_slots) | set(synthetic_measure_slots))
 
     if difficulty == TabDifficulty.EASY:
-        melody_events = [
-            (slot, midi_value)
-            for slot, midi_value in melody_events
-            if keep_easy_melody_slot(slot, measure_slots, first_ts)
-        ]
         chord_events = [(slot, simplify_chord_label(label)) for slot, label in chord_events]
         simplified_played: list[tuple[int, list[int]]] = []
         for slot, midi_values in played_chord_events:
@@ -1475,10 +1456,16 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
         if chord_chunk:
             plain_block.append(chord_chunk)
 
+        row_has_frets = False
         for string_index in [5, 4, 3, 2, 1, 0]:
             chunk = "".join(lines[string_index][char_start:char_end])
+            if any(ch.isdigit() for ch in chunk):
+                row_has_frets = True
             row_lines.append((STRING_NAMES[string_index], f"{chunk}|"))
             plain_block.append(f"{STRING_NAMES[string_index]}|{chunk}|")
+
+        if not row_has_frets and not chord_chunk and not row_note:
+            continue
 
         html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note))
         plain_rows.append("\n".join(plain_block))
