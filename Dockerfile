@@ -3,7 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive \
-    AUDIVERIS_BIN=/usr/bin/audiveris
+    AUDIVERIS_BIN=/usr/local/bin/audiveris
 
 WORKDIR /app
 
@@ -39,11 +39,17 @@ RUN set -eux; \
     dpkg-deb -x /tmp/audiveris.deb /tmp/audiveris-root; \
     cp -a /tmp/audiveris-root/. /; \
     rm -rf /tmp/audiveris-root; \
-    if [ ! -x /usr/bin/audiveris ]; then \
-      AUDIVERIS_CANDIDATE="$(find /usr -type f \( -name audiveris -o -name Audiveris \) | head -n 1)"; \
-      test -n "${AUDIVERIS_CANDIDATE}"; \
-      ln -sf "${AUDIVERIS_CANDIDATE}" /usr/bin/audiveris; \
+    if [ -x /opt/audiveris/bin/Audiveris ]; then \
+      ln -sf /opt/audiveris/bin/Audiveris /usr/local/bin/audiveris; \
+    elif [ -x /opt/Audiveris/bin/Audiveris ]; then \
+      ln -sf /opt/Audiveris/bin/Audiveris /usr/local/bin/audiveris; \
     fi; \
+    if [ ! -x /usr/local/bin/audiveris ]; then \
+      AUDIVERIS_CANDIDATE="$(find / -type f \( -name audiveris -o -name Audiveris \) 2>/dev/null | head -n 1)"; \
+      test -n "${AUDIVERIS_CANDIDATE}"; \
+      ln -sf "${AUDIVERIS_CANDIDATE}" /usr/local/bin/audiveris; \
+    fi; \
+    ln -sf /usr/local/bin/audiveris /usr/bin/audiveris; \
     test -x /usr/bin/audiveris; \
     rm -f /tmp/audiveris.deb; \
     rm -rf /var/lib/apt/lists/*
