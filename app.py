@@ -777,6 +777,14 @@ def normalize_chord_label(label: str) -> str:
     return cleaned
 
 
+def is_valid_chord_label(label: str) -> bool:
+    cleaned = (label or "").strip()
+    if not cleaned:
+        return False
+    lowered = cleaned.lower()
+    return "cannotbeidentified" not in lowered
+
+
 def extract_chord_token(raw_value: str) -> Optional[str]:
     raw = (raw_value or "").strip()
     if not raw:
@@ -985,15 +993,26 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     played_chord_events: list[tuple[int, list[int]]] = []
     seen_played_slots: set[int] = set()
 
+    def get_global_offset(source_obj: stream.Music21Object) -> Optional[float]:
+        try:
+            return float(source_obj.getOffsetInHierarchy(score))
+        except Exception:
+            measure_ctx = source_obj.getContextByClass(stream.Measure)
+            if measure_ctx is not None:
+                try:
+                    return float(measure_ctx.getOffsetInHierarchy(score)) + float(getattr(source_obj, "offset", 0.0) or 0.0)
+                except Exception:
+                    return None
+        return None
+
     def add_chord_event(raw_label: str, source_obj: stream.Music21Object) -> None:
         label = extract_chord_token(raw_label)
-        if not label or not CHORD_TEXT_RE.match(label):
+        if not label or not CHORD_TEXT_RE.match(label) or not is_valid_chord_label(label):
             return
-        try:
-            slot = quarter_to_slot(float(source_obj.getOffsetInHierarchy(score)))
-        except Exception:
-            # Skip unresolvable offsets to avoid collapsing all labels to slot 0.
+        offset = get_global_offset(source_obj)
+        if offset is None:
             return
+        slot = quarter_to_slot(offset)
         if slot in seen_chord_slots:
             return
         seen_chord_slots.add(slot)
@@ -1049,7 +1068,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                 inferred_label = normalize_chord_label(symbol.figure if symbol and symbol.figure else "")
             except Exception:
                 inferred_label = ""
-            if inferred_label:
+            if inferred_label and is_valid_chord_label(inferred_label):
                 seen_chord_slots.add(slot)
                 chord_events.append((slot, inferred_label))
 
@@ -1145,7 +1164,8 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             guessed = chord.Chord([pitch.Pitch(midi=v) for v in sorted(set(midi_values))])
             symbol = harmony.chordSymbolFromChord(guessed)
             label = symbol.figure if symbol and symbol.figure else ""
-            if label and label != last_inferred_label:
+            label = normalize_chord_label(label)
+            if label and is_valid_chord_label(label) and label != last_inferred_label:
                 chord_events.append((beat_slot, label))
                 last_inferred_label = label
 
@@ -1327,6 +1347,14 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
     chord_hit_span = max_span if difficulty == TabDifficulty.EASY else max(max_span, 6)
     chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else 12
 
+    def normalize_midi_to_guitar_range(midi_value: int) -> int:
+        moved = int(midi_value)
+        while moved > GUITAR_MAX_MIDI:
+            moved -= 12
+        while moved < GUITAR_MIN_MIDI:
+            moved += 12
+        return moved
+
     def try_place_midi_at_slot(
         slot: int,
         midi_value: int,
@@ -1363,7 +1391,7 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
     for slot, midi_values in display_played_chord_events:
         if slot >= display_total_slots:
             continue
-        unique_values = sorted(set(midi_values))
+        unique_values = sorted({normalize_midi_to_guitar_range(v) for v in midi_values})
         if difficulty == TabDifficulty.STANDARD and len(unique_values) > 3:
             unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
         for midi_value in unique_values:
