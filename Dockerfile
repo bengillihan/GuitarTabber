@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    DEBIAN_FRONTEND=noninteractive \
     AUDIVERIS_BIN=/usr/bin/audiveris
 
 WORKDIR /app
@@ -24,7 +25,14 @@ RUN set -eux; \
 
 # Install latest Audiveris Linux .deb from GitHub releases.
 RUN set -eux; \
-    AUDIVERIS_DEB_URL="$(curl -fsSL https://api.github.com/repos/Audiveris/audiveris/releases/latest | jq -r '.assets[] | select(.name | test("(?i)linux.*\\.deb$")) | .browser_download_url' | head -n 1)"; \
+    AUDIVERIS_JSON="$(curl -fsSL https://api.github.com/repos/Audiveris/audiveris/releases/latest)"; \
+    AUDIVERIS_DEB_URL="$(printf '%s' "${AUDIVERIS_JSON}" | jq -r '[.assets[]? | select(.name | test("ubuntu24\\.04.*x86_64\\.deb$")) | .browser_download_url][0] // empty')"; \
+    if [ -z "${AUDIVERIS_DEB_URL}" ]; then \
+      AUDIVERIS_DEB_URL="$(printf '%s' "${AUDIVERIS_JSON}" | jq -r '[.assets[]? | select(.name | test("ubuntu22\\.04.*x86_64\\.deb$")) | .browser_download_url][0] // empty')"; \
+    fi; \
+    if [ -z "${AUDIVERIS_DEB_URL}" ]; then \
+      AUDIVERIS_DEB_URL="$(printf '%s' "${AUDIVERIS_JSON}" | jq -r '[.assets[]? | select(.name | test("\\.deb$")) | .browser_download_url][0] // empty')"; \
+    fi; \
     test -n "${AUDIVERIS_DEB_URL}"; \
     curl -fsSL "${AUDIVERIS_DEB_URL}" -o /tmp/audiveris.deb; \
     apt-get update; \
