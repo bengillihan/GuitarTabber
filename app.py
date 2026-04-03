@@ -663,20 +663,25 @@ def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
             "Audiveris is not installed or not found. Set AUDIVERIS_BIN or upload MusicXML directly."
         ) from exc
 
+    generated: list[Path] = []
+    for pattern in ("*.musicxml", "*.mxl", "*.xml"):
+        generated.extend(output_dir.rglob(pattern))
+    generated = sorted(generated)
+
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
         detail = stderr or stdout or f"exit code {completed.returncode}"
+        # Audiveris can report a non-zero exit while still exporting usable XML
+        # (for example when one processing stage flags warnings/errors).
+        if generated:
+            return generated
         raise OMRConversionError(f"Audiveris conversion failed: {detail}")
-
-    generated = []
-    for pattern in ("*.musicxml", "*.mxl", "*.xml"):
-        generated.extend(output_dir.rglob(pattern))
 
     if not generated:
         raise OMRConversionError("Audiveris ran but no MusicXML output was produced.")
 
-    return sorted(generated)
+    return generated
 
 
 def quarter_to_slot(quarter_length: float) -> int:
