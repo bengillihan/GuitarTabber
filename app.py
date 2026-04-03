@@ -1,6 +1,8 @@
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from flask import Flask, abort, render_template_string, request, url_for
 from flask_sqlalchemy import SQLAlchemy
@@ -9,7 +11,10 @@ from werkzeug.utils import secure_filename
 
 
 UPLOAD_DIR = Path("uploads")
-ALLOWED_EXTENSIONS = {"musicxml", "xml", "mxl"}
+MUSICXML_EXTENSIONS = {"musicxml", "xml", "mxl"}
+PDF_EXTENSIONS = {"pdf"}
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"}
+ALLOWED_EXTENSIONS = MUSICXML_EXTENSIONS | PDF_EXTENSIONS | IMAGE_EXTENSIONS
 
 # MIDI note numbers for standard tuning, low E to high E.
 STANDARD_TUNING = [40, 45, 50, 55, 59, 64]
@@ -148,10 +153,10 @@ HOME_BODY = """
   <a href="{{ url_for('history') }}">View History</a>
 </div>
 <p>Upload a MusicXML file and get a first-pass fingerstyle tab.</p>
-<p class="hint">Supported formats: .musicxml, .xml, .mxl</p>
+<p class="hint">Supported formats: .musicxml, .xml, .mxl, .pdf, .png, .jpg, .jpeg, .webp</p>
 
 <form method="post" enctype="multipart/form-data">
-  <input type="file" name="music_file" accept=".musicxml,.xml,.mxl" required>
+  <input type="file" name="music_file" accept=".musicxml,.xml,.mxl,.pdf,.png,.jpg,.jpeg,.webp" required>
   <button type="submit">Generate Tab</button>
 </form>
 
@@ -252,6 +257,47 @@ def render_page(body_template: str, **context: object) -> str:
 
 def is_allowed_file(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def file_extension(filename: str) -> str:
+    if "." not in filename:
+        return ""
+    return filename.rsplit(".", 1)[1].lower()
+
+
+def omr_input_needs_conversion(filename: str) -> bool:
+    ext = file_extension(filename)
+    return ext in PDF_EXTENSIONS or ext in IMAGE_EXTENSIONS
+
+
+def convert_sheet_to_musicxml(source_path: Path) -> Path:
+    """Convert PDF/image sheet music to MusicXML using Audiveris."""
+    audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
+    output_dir = UPLOAD_DIR / "omr_exports" / f"{source_path.stem}-{uuid4().hex[:8]}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [audiveris_bin, "-batch", "-export", "-output", str(output_dir), str(source_path)]
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "Audiveris is not installed or not found. Set AUDIVERIS_BIN or upload MusicXML directly."
+        ) from exc
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or f"exit code {completed.returncode}"
+        raise RuntimeError(f"Audiveris conversion failed: {detail}")
+
+    generated = []
+    for pattern in ("*.musicxml", "*.mxl", "*.xml"):
+        generated.extend(output_dir.rglob(pattern))
+
+    if not generated:
+        raise RuntimeError("Audiveris ran but no MusicXML output was produced.")
+
+    return max(generated, key=lambda p: p.stat().st_mtime)
 
 
 def quarter_to_slot(quarter_length: float) -> int:
@@ -396,8 +442,14 @@ def arrange_tab(score: stream.Score) -> str:
     return "\n".join(rendered)
 
 
-def parse_musicxml(saved_path: Path, safe_name: str) -> dict[str, str]:
-    score = converter.parse(str(saved_path))
+def parse_sheet_to_tab(saved_path: Path, safe_name: str) -> dict[str, str]:
+    parse_path = saved_path
+    source_label = safe_name
+    if omr_input_needs_conversion(safe_name):
+        parse_path = convert_sheet_to_musicxml(saved_path)
+        source_label = f"{safe_name} (via OMR: {parse_path.name})"
+
+    score = converter.parse(str(parse_path))
 
     title = safe_name
     if score.metadata and score.metadata.title:
@@ -413,7 +465,7 @@ def parse_musicxml(saved_path: Path, safe_name: str) -> dict[str, str]:
     tab = arrange_tab(score)
     header = [
         f"# {title}",
-        f"# Source file: {safe_name}",
+        f"# Source file: {source_label}",
         f"# Estimated key: {key_name}",
         "# Layout: basic melody (high strings) + bass (low strings)",
         "",
@@ -435,9 +487,9 @@ def index():
         upload = request.files.get("music_file")
 
         if upload is None or not upload.filename:
-            error = "Please choose a MusicXML file to upload."
+            error = "Please choose a MusicXML, PDF, or image file to upload."
         elif not is_allowed_file(upload.filename):
-            error = "Unsupported file type. Please upload .musicxml, .xml, or .mxl."
+            error = "Unsupported file type. Upload MusicXML, PDF, or sheet-music image formats."
         else:
             UPLOAD_DIR.mkdir(exist_ok=True)
             safe_name = secure_filename(upload.filename)
@@ -445,7 +497,7 @@ def index():
             upload.save(saved_path)
 
             try:
-                parsed = parse_musicxml(saved_path, safe_name)
+                parsed = parse_sheet_to_tab(saved_path, safe_name)
                 file_bytes = saved_path.read_bytes()
                 song = Song(
                     title=parsed["song_title"],
@@ -472,7 +524,7 @@ def index():
                 }
             except Exception as exc:
                 db.session.rollback()
-                error = f"Could not parse MusicXML: {exc}"
+                error = f"Could not generate tab from this file: {exc}"
 
     return render_page(HOME_BODY, error=error, result=result)
 

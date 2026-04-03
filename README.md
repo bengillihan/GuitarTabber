@@ -13,7 +13,14 @@ pip install -r requirements.txt
 python3 app.py
 ```
 
-Open `http://127.0.0.1:5000` and upload a `.musicxml`, `.xml`, or `.mxl` file.
+Open `http://127.0.0.1:5000` and upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, or sheet-image files.
+
+## PDF/Image Uploads (OMR)
+
+- PDF/image support uses Audiveris to convert sheet music into MusicXML first.
+- Install Audiveris and ensure `audiveris` is available in `PATH`.
+- Or set `AUDIVERIS_BIN` to your Audiveris executable path.
+- If Audiveris is unavailable, MusicXML uploads still work.
 
 ## Database
 
@@ -24,7 +31,7 @@ Open `http://127.0.0.1:5000` and upload a `.musicxml`, `.xml`, or `.mxl` file.
 
 ## Current scope
 
-- Upload MusicXML
+- Upload MusicXML, PDF, or sheet images
 - Parse score with `music21`
 - Build a basic arrangement:
   - melody biased to high strings
