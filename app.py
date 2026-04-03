@@ -149,6 +149,28 @@ BASE_PAGE = """
       margin-top: 1.25rem;
       padding-top: 1.25rem;
     }
+    .tab-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.65rem;
+      margin: 0.75rem 0 0.4rem;
+    }
+    .tab-controls label {
+      color: #4f4936;
+      font-size: 0.95rem;
+    }
+    .tab-size-range {
+      width: 220px;
+      max-width: 100%;
+    }
+    .tab-size-value {
+      font-weight: 700;
+      color: #2f5f3b;
+      min-width: 2.1rem;
+      display: inline-block;
+      text-align: right;
+    }
     .meta {
       color: #4f4936;
       font-size: 0.95rem;
@@ -173,6 +195,7 @@ BASE_PAGE = """
       line-height: 1.35;
     }
     .tab-container {
+      --tab-font-size: 15px;
       display: flex;
       flex-direction: column;
       gap: 1rem;
@@ -190,6 +213,7 @@ BASE_PAGE = """
       font-style: italic;
       white-space: pre;
       font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: var(--tab-font-size);
       margin-bottom: 0.25rem;
     }
     .tab-chords {
@@ -197,6 +221,7 @@ BASE_PAGE = """
       font-weight: 700;
       white-space: pre;
       font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: var(--tab-font-size);
       margin-bottom: 0.35rem;
     }
     .tab-strings {
@@ -204,7 +229,7 @@ BASE_PAGE = """
       flex-direction: column;
       gap: 0.1rem;
       font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
-      font-size: 0.95rem;
+      font-size: var(--tab-font-size);
       white-space: pre;
       min-width: max-content;
     }
@@ -244,6 +269,94 @@ BASE_PAGE = """
   <main>
     {{ body|safe }}
   </main>
+  <script>
+    (function () {
+      const tabContainer = document.querySelector(".tab-container");
+      if (!tabContainer) return;
+
+      const sizeInput = document.querySelector(".tab-size-range");
+      const sizeValue = document.querySelector(".tab-size-value");
+      const fitButton = document.querySelector(".tab-fit-btn");
+      const STORAGE_KEY = "guitartabber_tab_font_px";
+
+      function updateSizeLabel(px) {
+        if (sizeValue) {
+          sizeValue.textContent = Number(px).toFixed(1);
+        }
+      }
+
+      function applyTabSize(px) {
+        const normalized = Math.max(8, Math.min(20, Number(px) || 15));
+        document.querySelectorAll(".tab-container").forEach((container) => {
+          container.style.setProperty("--tab-font-size", normalized + "px");
+        });
+        if (sizeInput) sizeInput.value = String(normalized);
+        updateSizeLabel(normalized);
+        try {
+          localStorage.setItem(STORAGE_KEY, String(normalized));
+        } catch (e) {
+          // Ignore storage failures.
+        }
+      }
+
+      function contentFitsRow(row) {
+        const available = row.clientWidth - 4;
+        if (available <= 0) return true;
+        const blocks = row.querySelectorAll(".tab-notes, .tab-chords, .tab-strings");
+        if (!blocks.length) return true;
+        for (const block of blocks) {
+          if (block.scrollWidth > available) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function allRowsFit() {
+        const rows = document.querySelectorAll(".tab-row");
+        if (!rows.length) return true;
+        for (const row of rows) {
+          if (!contentFitsRow(row)) return false;
+        }
+        return true;
+      }
+
+      function fitTabsToScreen() {
+        const minSize = Number(sizeInput ? sizeInput.min : 8) || 8;
+        let size = Number(sizeInput ? sizeInput.value : 15) || 15;
+        applyTabSize(size);
+        while (size > minSize && !allRowsFit()) {
+          size = Math.max(minSize, size - 0.5);
+          applyTabSize(size);
+        }
+      }
+
+      let initialSize = 15;
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY);
+        if (stored) initialSize = Number(stored) || initialSize;
+      } catch (e) {
+        // Ignore storage failures.
+      }
+      applyTabSize(initialSize);
+
+      if (sizeInput) {
+        sizeInput.addEventListener("input", () => applyTabSize(sizeInput.value));
+      }
+
+      if (fitButton) {
+        fitButton.addEventListener("click", fitTabsToScreen);
+      }
+
+      requestAnimationFrame(() => {
+        if (!allRowsFit()) fitTabsToScreen();
+      });
+
+      window.addEventListener("resize", () => {
+        if (!allRowsFit()) fitTabsToScreen();
+      });
+    })();
+  </script>
 </body>
 </html>
 """
@@ -282,7 +395,12 @@ HOME_BODY = """
     {% if result.truncation_warning %}
       <div class="warning">{{ result.truncation_warning }}</div>
     {% endif %}
-    <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download .txt</a></p>
+<p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download .txt</a></p>
+    <div class="tab-controls">
+      <label>Tab text size: <span class="tab-size-value">15.0</span>px</label>
+      <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
+      <button type="button" class="tab-fit-btn">Fit To Screen</button>
+    </div>
     {{ result.tab_html|safe }}
   </section>
 {% endif %}
@@ -347,6 +465,11 @@ ARRANGEMENT_BODY = """
   <p class="meta">{{ transpose_note }}</p>
 {% endif %}
 {% if row.tab_html %}
+  <div class="tab-controls">
+    <label>Tab text size: <span class="tab-size-value">15.0</span>px</label>
+    <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
+    <button type="button" class="tab-fit-btn">Fit To Screen</button>
+  </div>
   {{ row.tab_html|safe }}
 {% else %}
   <pre>{{ row.tab_text }}</pre>
