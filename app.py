@@ -40,6 +40,7 @@ KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
 GUITAR_MIN_MIDI = 40
 GUITAR_MAX_MIDI = 79
+DEFAULT_MAX_UPLOAD_MB = 20
 CHORD_TEXT_RE = re.compile(
     r"^[A-G](?:b|#)?(?:(?:maj|min|m|dim|aug|sus|add)?\d*)?(?:/[A-G](?:b|#)?)?$"
 )
@@ -386,6 +387,7 @@ HOME_BODY = """
 </div>
 <p>Upload sheet music (MusicXML, PDF, or image) and get a first-pass fingerstyle tab.</p>
 <p class="hint">Supported formats: .musicxml, .xml, .mxl, .pdf, .png, .jpg, .jpeg, .webp</p>
+<p class="hint">Max upload size: {{ max_upload_mb }} MB</p>
 
 {% if omr_warning %}
   <div class="warning">{{ omr_warning }}</div>
@@ -517,7 +519,18 @@ def normalize_database_url(raw_url: Optional[str]) -> str:
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB upload limit
+
+def resolve_max_upload_mb() -> int:
+    raw = os.getenv("MAX_UPLOAD_MB", str(DEFAULT_MAX_UPLOAD_MB))
+    try:
+        mb = int(raw)
+    except Exception:
+        mb = DEFAULT_MAX_UPLOAD_MB
+    return max(5, min(100, mb))
+
+
+MAX_UPLOAD_MB = resolve_max_upload_mb()
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 raw_db_url = os.getenv("DATABASE_URL") or os.getenv("Database_URL")
 app.config["SQLALCHEMY_DATABASE_URI"] = normalize_database_url(raw_db_url)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -645,15 +658,51 @@ def is_omr_available() -> bool:
     return resolved is not None
 
 
+def collect_generated_musicxml(output_dir: Path) -> list[Path]:
+    generated: list[Path] = []
+    for pattern in ("*.musicxml", "*.mxl", "*.xml"):
+        generated.extend(output_dir.rglob(pattern))
+    return sorted(generated)
+
+
+def run_audiveris_export(audiveris_bin: str, output_dir: Path, source_path: Path) -> tuple[int, str, str]:
+    cmd = [audiveris_bin, "-batch", "-export", "-output", str(output_dir), str(source_path)]
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS)
+    return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path]:
+    gs_bin = shutil.which("gs")
+    if gs_bin is None:
+        return None
+    image_dir = work_dir / "omr_raster"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    output_png = image_dir / f"{source_path.stem}_page1_300dpi.png"
+    cmd = [
+        gs_bin,
+        "-dSAFER",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-sDEVICE=pnggray",
+        "-r300",
+        "-dFirstPage=1",
+        "-dLastPage=1",
+        f"-sOutputFile={output_png}",
+        str(source_path),
+    ]
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS)
+    if completed.returncode != 0 or not output_png.exists():
+        return None
+    return output_png
+
+
 def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
     """Convert PDF/image sheet music to MusicXML using Audiveris."""
     audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
     output_dir = work_dir / "omr_exports"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [audiveris_bin, "-batch", "-export", "-output", str(output_dir), str(source_path)]
     try:
-        completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS)
+        returncode, stdout, stderr = run_audiveris_export(audiveris_bin, output_dir, source_path)
     except subprocess.TimeoutExpired as exc:
         raise OMRConversionError(
             f"OMR timed out after {OMR_TIMEOUT_SECONDS}s. Try a smaller/cropped PDF page."
@@ -663,22 +712,51 @@ def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
             "Audiveris is not installed or not found. Set AUDIVERIS_BIN or upload MusicXML directly."
         ) from exc
 
-    generated: list[Path] = []
-    for pattern in ("*.musicxml", "*.mxl", "*.xml"):
-        generated.extend(output_dir.rglob(pattern))
-    generated = sorted(generated)
+    generated = collect_generated_musicxml(output_dir)
 
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
-        detail = stderr or stdout or f"exit code {completed.returncode}"
+    if returncode != 0:
+        stderr = stderr.strip()
+        stdout = stdout.strip()
+        detail = stderr or stdout or f"exit code {returncode}"
         # Audiveris can report a non-zero exit while still exporting usable XML
         # (for example when one processing stage flags warnings/errors).
         if generated:
             return generated
+        # Retry path for camera-photo PDFs: rasterize first page and retry Audiveris
+        # on a high-resolution grayscale PNG, which is often more robust than direct PDF.
+        if file_extension(source_path.name) == "pdf":
+            raster_png = rasterize_pdf_first_page(source_path, work_dir)
+            if raster_png is not None:
+                output_dir_retry = work_dir / "omr_exports_retry"
+                output_dir_retry.mkdir(parents=True, exist_ok=True)
+                try:
+                    retry_code, retry_stdout, retry_stderr = run_audiveris_export(audiveris_bin, output_dir_retry, raster_png)
+                except subprocess.TimeoutExpired:
+                    retry_code = 1
+                    retry_stdout = ""
+                    retry_stderr = "timeout during retry from rasterized PDF"
+                retry_generated = collect_generated_musicxml(output_dir_retry)
+                if retry_generated:
+                    return retry_generated
+                retry_detail = (retry_stderr or retry_stdout or f"exit code {retry_code}").strip()
+                raise OMRConversionError(
+                    f"Audiveris conversion failed: {detail}. Retry from rasterized PDF also failed: {retry_detail}"
+                )
         raise OMRConversionError(f"Audiveris conversion failed: {detail}")
 
     if not generated:
+        if file_extension(source_path.name) == "pdf":
+            raster_png = rasterize_pdf_first_page(source_path, work_dir)
+            if raster_png is not None:
+                output_dir_retry = work_dir / "omr_exports_retry"
+                output_dir_retry.mkdir(parents=True, exist_ok=True)
+                try:
+                    run_audiveris_export(audiveris_bin, output_dir_retry, raster_png)
+                except subprocess.TimeoutExpired:
+                    pass
+                retry_generated = collect_generated_musicxml(output_dir_retry)
+                if retry_generated:
+                    return retry_generated
         raise OMRConversionError("Audiveris ran but no MusicXML output was produced.")
 
     return generated
@@ -1875,6 +1953,20 @@ def parse_sheet_to_tab(
     }
 
 
+@app.errorhandler(413)
+def request_entity_too_large(_error):
+    message = f"File is too large. Please upload a file up to {MAX_UPLOAD_MB} MB."
+    return render_page(
+        HOME_BODY,
+        error=message,
+        result=None,
+        omr_warning=None if is_omr_available() else "OMR is currently unavailable on this server. PDF/image uploads may fail; MusicXML uploads still work.",
+        difficulty_options=difficulty_options(),
+        selected_difficulty=TabDifficulty.STANDARD.value,
+        max_upload_mb=MAX_UPLOAD_MB,
+    ), 413
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     error = None
@@ -1954,6 +2046,7 @@ def index():
         omr_warning=omr_warning,
         difficulty_options=difficulty_options(),
         selected_difficulty=selected_difficulty.value,
+        max_upload_mb=MAX_UPLOAD_MB,
     )
 
 
