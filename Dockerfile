@@ -35,8 +35,13 @@ RUN set -eux; \
     fi; \
     test -n "${AUDIVERIS_DEB_URL}"; \
     curl -fsSL "${AUDIVERIS_DEB_URL}" -o /tmp/audiveris.deb; \
-    # Extract package payload directly to avoid desktop post-install scripts in headless containers.
-    dpkg-deb -x /tmp/audiveris.deb /; \
+    # Headless containers can fail Audiveris post-install desktop integration.
+    # Temporarily no-op xdg-desktop-menu so package configuration succeeds.
+    printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/xdg-desktop-menu; \
+    chmod +x /usr/local/bin/xdg-desktop-menu; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends /tmp/audiveris.deb; \
+    rm -f /usr/local/bin/xdg-desktop-menu; \
     test -x /usr/bin/audiveris; \
     rm -f /tmp/audiveris.deb; \
     rm -rf /var/lib/apt/lists/*
