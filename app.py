@@ -794,7 +794,8 @@ def find_positions(
     if prefer_open:
         candidates.sort(key=lambda c: (0 if c[1] == 0 else 1, c[1], priority_index.get(c[0], 99)))
     else:
-        candidates.sort(key=lambda c: (c[1], priority_index.get(c[0], 99), 0 if c[1] == 0 else 1))
+        # Deprioritize open strings (fret 0) so fretted positions are tried first.
+        candidates.sort(key=lambda c: (1 if c[1] == 0 else 0, c[1], priority_index.get(c[0], 99)))
     return candidates
 
 
@@ -1395,13 +1396,17 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     # Final harmonic fallback: derive simple chord labels from played chord
     # events when explicit symbols/text are sparse or missing.
-    for slot, midi_values in played_chord_events:
+    # Only emit a label when the chord name *changes* to avoid flooding dense
+    # accompaniment with identical consecutive labels.
+    last_fallback_label = ""
+    for slot, midi_values in sorted(played_chord_events, key=lambda x: x[0]):
         if slot in seen_chord_slots:
             continue
         guessed = normalize_chord_label(infer_simple_chord_label(midi_values))
-        if guessed and is_valid_chord_label(guessed):
+        if guessed and is_valid_chord_label(guessed) and guessed != last_fallback_label:
             seen_chord_slots.add(slot)
             chord_events.append((slot, guessed))
+            last_fallback_label = guessed
 
     # Lyric-anchored labels: carry active harmony onto lyric-note slots so
     # users see chord names where words occur in lead sheets.
@@ -1595,7 +1600,7 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
         for slot, midi_value in display_inner_events:
             if slot >= display_total_slots:
                 continue
-            try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret)
+            try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret, span_limit=MAX_FRETTED_SPAN)
 
     if difficulty == TabDifficulty.COMPLETE:
         # Try filling implied chord tones at chord-change beats to make fuller voicings.
