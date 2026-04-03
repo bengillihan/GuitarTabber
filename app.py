@@ -40,6 +40,9 @@ KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
 GUITAR_MIN_MIDI = 40
 GUITAR_MAX_MIDI = 79
+CHORD_TEXT_RE = re.compile(
+    r"^[A-G](?:b|#)?(?:(?:maj|min|m|dim|aug|sus|add)?\d*)?(?:/[A-G](?:b|#)?)?$"
+)
 
 
 class TabDifficulty(str, Enum):
@@ -776,6 +779,19 @@ def keep_easy_melody_slot(slot: int, measure_starts: list[int], first_ts: Option
     return in_measure == 0
 
 
+def keep_easy_chord_slot(slot: int, measure_starts: list[int], first_ts: Optional[meter.TimeSignature]) -> bool:
+    if not measure_starts:
+        return True
+    measure_index = bisect_right(measure_starts, slot) - 1
+    measure_start = measure_starts[max(0, measure_index)]
+    in_measure = max(0, slot - measure_start)
+    num = getattr(first_ts, "numerator", None) if first_ts else None
+    den = getattr(first_ts, "denominator", None) if first_ts else None
+    if num == 4 and den == 4:
+        return in_measure in {0, 8}  # beats 1 and 3
+    return in_measure == 0
+
+
 def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.STANDARD) -> ScoreEvents:
     full_flat = score.flatten()
     parts = list(score.parts)
@@ -829,8 +845,36 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                     events.append((slot, midi_values[-1] if mode == "high" else midi_values[0]))
         return events, max_slot
 
+    def collect_highest_per_slot(source: stream.Stream) -> tuple[list[tuple[int, int]], int]:
+        by_slot: dict[int, int] = {}
+        max_slot = 0
+        for element in source.flatten().notesAndRests:
+            slot = quarter_to_slot(float(element.offset))
+            max_slot = max(max_slot, slot + 1)
+            midi_value: Optional[int] = None
+            if isinstance(element, note.Note):
+                midi_value = int(element.pitch.midi)
+            elif isinstance(element, chord.Chord):
+                midi_values = [int(p.midi) for p in element.pitches]
+                if midi_values:
+                    midi_value = max(midi_values)
+            if midi_value is None:
+                continue
+            current = by_slot.get(slot)
+            if current is None or midi_value > current:
+                by_slot[slot] = midi_value
+        return sorted(by_slot.items()), max_slot
+
     melody_events, melody_max_slot = collect_part_events(melody_source, mode="high", voice_filter=melody_voice)
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
+
+    # In Standard/Complete, prefer "highest note per slot" from top staff to
+    # avoid OMR voice-ID mistakes in SATB shared-stem notation.
+    if parts and difficulty != TabDifficulty.EASY:
+        top_staff_events, top_staff_max_slot = collect_highest_per_slot(parts[0])
+        if top_staff_events:
+            melody_events = top_staff_events
+            melody_max_slot = max(melody_max_slot, top_staff_max_slot)
 
     # Fallback: if voice-filtering produces sparse melody (common in imperfect OMR),
     # fall back to unfiltered first-part melody using a relative threshold.
@@ -861,7 +905,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     played_chord_events: list[tuple[int, list[int]]] = []
     seen_played_slots: set[int] = set()
 
-    # Prefer explicit MusicXML chord symbols when available.
+    # Prefer explicit MusicXML chord symbols when available and preserve labels verbatim.
     for symbol in score.recurse().getElementsByClass(harmony.ChordSymbol):
         label = str(getattr(symbol, "figure", "") or "").strip()
         if not label:
@@ -871,6 +915,20 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             continue
         seen_chord_slots.add(slot)
         chord_events.append((slot, label))
+
+    # Fallback: many OMR exports parse chord text as generic text expressions.
+    for text_item in score.recurse().getElementsByClass(expressions.TextExpression):
+        raw_value = str(getattr(text_item, "content", None) or text_item or "").strip()
+        value = raw_value.replace(" ", "")
+        if not value or not CHORD_TEXT_RE.match(value):
+            continue
+        slot = quarter_to_slot(float(text_item.getOffsetInHierarchy(score)))
+        if slot in seen_chord_slots:
+            continue
+        seen_chord_slots.add(slot)
+        chord_events.append((slot, value))
+
+    has_explicit_chords = len(chord_events) > 0
 
     # Capture explicit written chord attacks (especially in lower staves) so
     # they can be rendered as actual tab notes, not only labels.
@@ -882,7 +940,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         if slot not in seen_played_slots:
             seen_played_slots.add(slot)
             played_chord_events.append((slot, midi_values))
-        if slot not in seen_chord_slots:
+        if (not has_explicit_chords) and slot not in seen_chord_slots:
             try:
                 symbol = harmony.chordSymbolFromChord(chord_obj)
                 inferred_label = symbol.figure if symbol and symbol.figure else ""
@@ -891,6 +949,23 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             if inferred_label:
                 seen_chord_slots.add(slot)
                 chord_events.append((slot, inferred_label))
+
+    # Also reconstruct vertical lower-staff chords from simultaneous Note objects
+    # when OMR does not emit chord.Chord containers.
+    lower_verticals: dict[int, set[int]] = {}
+    for item in bass_source.flatten().notes:
+        slot = quarter_to_slot(float(item.offset))
+        bucket = lower_verticals.setdefault(slot, set())
+        if isinstance(item, note.Note):
+            bucket.add(int(item.pitch.midi))
+        elif isinstance(item, chord.Chord):
+            bucket.update(int(p.midi) for p in item.pitches)
+    for slot, values in lower_verticals.items():
+        midi_values = sorted(values)
+        if len(midi_values) < 2 or slot in seen_played_slots:
+            continue
+        seen_played_slots.add(slot)
+        played_chord_events.append((slot, midi_values))
 
     max_offset = float(full_flat.highestTime)
     beat_step = 1.0
@@ -911,11 +986,40 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             except Exception:
                 pass
 
+    def collect_vertical_pitches_at_offset(offset: float) -> list[int]:
+        vertical = bass_source.flatten().notes.getElementsByOffset(
+            offset, mustBeginInSpan=True, includeEndBoundary=False
+        )
+        values: list[int] = []
+        for item in vertical:
+            if isinstance(item, note.Note):
+                values.append(int(item.pitch.midi))
+            elif isinstance(item, chord.Chord):
+                values.extend(int(p.midi) for p in item.pitches)
+        return sorted(set(values))
+
+    # Meter-aware chord-hit capture to increase accompaniment density.
+    beat = 0.0
+    while beat <= max_offset:
+        slot = quarter_to_slot(beat)
+        midi_values = collect_vertical_pitches_at_offset(beat)
+        if len(midi_values) >= 2:
+            if difficulty == TabDifficulty.EASY and not keep_easy_chord_slot(slot, measure_slots, first_ts):
+                beat += beat_step
+                continue
+            if slot not in seen_played_slots:
+                seen_played_slots.add(slot)
+                played_chord_events.append((slot, midi_values))
+        beat += beat_step
+
     beat = 0.0
     last_inferred_label = ""
     while beat <= max_offset:
         beat_slot = quarter_to_slot(beat)
         if beat_slot in seen_chord_slots:
+            beat += beat_step
+            continue
+        if has_explicit_chords:
             beat += beat_step
             continue
         vertical = full_flat.notes.getElementsByOffset(beat, mustBeginInSpan=True, includeEndBoundary=False)
@@ -980,12 +1084,12 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     # Fallback: some OMR exports flatten measure metadata. Synthesize bar starts
     # from time signature so wrapping still happens at real measure boundaries.
-    if len(measure_slots) <= 1:
-        bar_quarters = 4.0
-        if first_ts is not None and first_ts.barDuration is not None:
-            bar_quarters = float(first_ts.barDuration.quarterLength)
-        bar_slots = max(1, quarter_to_slot(bar_quarters))
-        measure_slots = list(range(0, total_slots, bar_slots))
+    bar_quarters = 4.0
+    if first_ts is not None and first_ts.barDuration is not None:
+        bar_quarters = float(first_ts.barDuration.quarterLength)
+    bar_slots = max(1, quarter_to_slot(bar_quarters))
+    synthetic_measure_slots = list(range(0, total_slots, bar_slots))
+    measure_slots = sorted(set(measure_slots) | set(synthetic_measure_slots))
 
     if difficulty == TabDifficulty.EASY:
         melody_events = [
@@ -1059,59 +1163,112 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_
 
 def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.STANDARD) -> tuple[str, str, bool]:
     events = gather_events(score, difficulty=difficulty)
-    lines = {idx: ["-"] * (events.total_slots * SLOT_WIDTH) for idx in range(6)}
+    measure_starts = sorted({slot for slot in events.measure_slots if 0 <= slot < events.total_slots})
+    if not measure_starts or measure_starts[0] != 0:
+        measure_starts = [0] + measure_starts
+
+    # Visual spacing pass: sparse measures are stretched horizontally so quarter-note
+    # rhythms remain readable even when OMR durations are noisy.
+    onset_slots: set[int] = set()
+    onset_slots.update(slot for slot, _ in events.melody_events)
+    onset_slots.update(slot for slot, _ in events.bass_events)
+    onset_slots.update(slot for slot, _ in events.inner_events)
+    onset_slots.update(slot for slot, _ in events.played_chord_events)
+    onset_slots = {slot for slot in onset_slots if 0 <= slot < events.total_slots}
+
+    remap_ranges: list[tuple[int, int, int, int]] = []
+    out_cursor = 0
+    for idx, start_slot in enumerate(measure_starts):
+        end_slot = measure_starts[idx + 1] if idx + 1 < len(measure_starts) else events.total_slots
+        if end_slot <= start_slot:
+            continue
+        count = len([slot for slot in onset_slots if start_slot <= slot < end_slot])
+        stretch = 2 if count <= 4 else 1
+        width = (end_slot - start_slot) * stretch
+        remap_ranges.append((start_slot, end_slot, out_cursor, stretch))
+        out_cursor += width
+
+    def remap_slot(slot: int) -> int:
+        for start, end, out_start, stretch in remap_ranges:
+            if start <= slot < end:
+                return out_start + (slot - start) * stretch
+        return slot
+
+    display_total_slots = max(out_cursor, 1)
+    display_melody_events = [(remap_slot(slot), midi_value) for slot, midi_value in events.melody_events]
+    display_bass_events = [(remap_slot(slot), midi_value) for slot, midi_value in events.bass_events]
+    display_inner_events = [(remap_slot(slot), midi_value) for slot, midi_value in events.inner_events]
+    display_played_chord_events = [(remap_slot(slot), midi_values) for slot, midi_values in events.played_chord_events]
+    display_chord_events = [(remap_slot(slot), label) for slot, label in events.chord_events]
+    display_section_events = [(remap_slot(slot), label) for slot, label in events.section_events]
+    display_measure_slots = sorted({remap_slot(slot) for slot in measure_starts})
+
+    lines = {idx: ["-"] * (display_total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
     melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 14
     bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 10)
     inner_max_fret = 9 if difficulty == TabDifficulty.EASY else 14
     max_span = 3 if difficulty == TabDifficulty.EASY else (7 if difficulty == TabDifficulty.COMPLETE else MAX_FRETTED_SPAN)
+    chord_hit_span = max_span if difficulty == TabDifficulty.EASY else max(max_span, 6)
+    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else 12
 
     def try_place_midi_at_slot(
         slot: int,
         midi_value: int,
         preferred_strings: list[int],
         max_fret: int,
+        span_limit: Optional[int] = None,
     ) -> bool:
         candidates = find_positions(midi_value, preferred_strings=preferred_strings, max_fret=max_fret)
         for string_index, fret in candidates:
             if not slot_is_free(lines[string_index], slot):
                 continue
             existing_frets = slot_fretted_notes.get(slot, [])
-            if not can_place_fret_at_slot(existing_frets, fret, max_fretted_span=max_span):
+            span = max_span if span_limit is None else span_limit
+            if not can_place_fret_at_slot(existing_frets, fret, max_fretted_span=span):
                 continue
             place_token(lines[string_index], slot, str(fret))
             slot_fretted_notes.setdefault(slot, []).append(fret)
             return True
         return False
 
-    for slot, midi_value in events.melody_events:
-        if slot >= events.total_slots:
+    for slot, midi_value in display_melody_events:
+        if slot >= display_total_slots:
             continue
         try_place_midi_at_slot(slot, midi_value, preferred_strings=[5, 4, 3, 2], max_fret=melody_max_fret)
 
-    for slot, midi_value in events.bass_events:
-        if slot >= events.total_slots:
+    for slot, midi_value in display_bass_events:
+        if slot >= display_total_slots:
             continue
         try_place_midi_at_slot(slot, midi_value, preferred_strings=[0, 1, 2, 3], max_fret=bass_max_fret)
 
     # Render explicit played chord stacks from score events so chord attacks
     # appear as actual tab notes (not just text labels above the stave).
     chord_strings = [0, 1, 2, 3, 4] if difficulty != TabDifficulty.COMPLETE else [0, 1, 2, 3, 4, 5]
-    for slot, midi_values in events.played_chord_events:
-        if slot >= events.total_slots:
+    for slot, midi_values in display_played_chord_events:
+        if slot >= display_total_slots:
             continue
-        for midi_value in sorted(set(midi_values)):
-            try_place_midi_at_slot(slot, midi_value, preferred_strings=chord_strings, max_fret=bass_max_fret)
+        unique_values = sorted(set(midi_values))
+        if difficulty == TabDifficulty.STANDARD and len(unique_values) > 3:
+            unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
+        for midi_value in unique_values:
+            try_place_midi_at_slot(
+                slot,
+                midi_value,
+                preferred_strings=chord_strings,
+                max_fret=chord_hit_max_fret,
+                span_limit=chord_hit_span,
+            )
 
     if difficulty == TabDifficulty.COMPLETE:
-        for slot, midi_value in events.inner_events:
-            if slot >= events.total_slots:
+        for slot, midi_value in display_inner_events:
+            if slot >= display_total_slots:
                 continue
             try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret)
 
         # Try filling implied chord tones at chord-change beats to make fuller voicings.
-        for slot, chord_label in events.chord_events:
-            if slot >= events.total_slots:
+        for slot, chord_label in display_chord_events:
+            if slot >= display_total_slots:
                 continue
             try:
                 symbol = harmony.ChordSymbol(chord_label)
@@ -1121,39 +1278,39 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
             for midi_value in chord_midis[:4]:
                 try_place_midi_at_slot(slot, midi_value, preferred_strings=[2, 3, 1, 4, 0, 5], max_fret=inner_max_fret)
 
-    place_measure_dividers(lines, events.measure_slots)
+    place_measure_dividers(lines, display_measure_slots)
 
-    chord_line = build_chord_line(events.total_slots, events.chord_events)
-    measure_starts = sorted({slot for slot in events.measure_slots if 0 <= slot < events.total_slots})
-    if not measure_starts or measure_starts[0] != 0:
-        measure_starts = [0] + measure_starts
+    chord_line = build_chord_line(display_total_slots, display_chord_events)
+    row_measure_starts = display_measure_slots[:]
+    if not row_measure_starts or row_measure_starts[0] != 0:
+        row_measure_starts = [0] + row_measure_starts
 
     # Build row boundaries by keeping complete measures together while targeting
     # a readable on-screen width.
     row_ranges: list[tuple[int, int]] = []
     idx = 0
     max_slots_per_row = max(1, TAB_TARGET_CHARS_PER_ROW // SLOT_WIDTH)
-    while idx < len(measure_starts):
+    while idx < len(row_measure_starts):
         row_start_idx = idx
-        row_start_slot = measure_starts[row_start_idx]
+        row_start_slot = row_measure_starts[row_start_idx]
         row_end_idx = row_start_idx + 1
 
         # Keep adding whole measures while we stay within both configured limits.
-        while row_end_idx < len(measure_starts):
+        while row_end_idx < len(row_measure_starts):
             if (row_end_idx - row_start_idx) >= MEASURES_PER_ROW:
                 break
-            candidate_end_slot = measure_starts[row_end_idx]
+            candidate_end_slot = row_measure_starts[row_end_idx]
             if (candidate_end_slot - row_start_slot) > max_slots_per_row:
                 break
             row_end_idx += 1
 
-        if row_end_idx < len(measure_starts):
-            row_end_slot = measure_starts[row_end_idx]
+        if row_end_idx < len(row_measure_starts):
+            row_end_slot = row_measure_starts[row_end_idx]
         else:
-            row_end_slot = events.total_slots
+            row_end_slot = display_total_slots
 
         if row_end_slot <= row_start_slot:
-            row_end_slot = min(events.total_slots, row_start_slot + 1)
+            row_end_slot = min(display_total_slots, row_start_slot + 1)
 
         row_ranges.append((row_start_slot, row_end_slot))
         idx = row_end_idx
@@ -1165,7 +1322,7 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
         char_start = start_slot * SLOT_WIDTH
         char_end = end_slot * SLOT_WIDTH
         chord_chunk = chord_line[char_start:char_end].rstrip()
-        row_note = "  ".join(label for slot, label in events.section_events if start_slot <= slot < end_slot)
+        row_note = "  ".join(label for slot, label in display_section_events if start_slot <= slot < end_slot)
 
         row_lines: list[tuple[str, str]] = []
         plain_block: list[str] = []
