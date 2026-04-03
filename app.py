@@ -828,62 +828,210 @@ def _imagemagick_bin() -> Optional[str]:
     return None
 
 
+def detect_is_camera_photo(source_path: Path) -> bool:
+    """
+    Return True when the file is likely a camera/phone photograph rather than a
+    clean flatbed scan or computer-generated PDF.
+
+    Checked in order:
+      1. HEIC/HEIF format  → always a camera photo (iPhone/Android default)
+      2. EXIF camera metadata (Make / Model / LensMake) embedded in the file
+         — detected via ImageMagick identify if available
+    """
+    ext = file_extension(source_path.name)
+    if ext in {"heic", "heif"}:
+        return True
+
+    im_bin = _imagemagick_bin()
+    if im_bin and ext in IMAGE_EXTENSIONS:
+        try:
+            if im_bin == "magick":
+                cmd = ["magick", "identify", "-verbose", str(source_path)]
+            else:
+                cmd = ["identify", "-verbose", str(source_path)]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=15)
+            output = result.stdout.lower()
+            if any(m in output for m in ("exif:make:", "exif:model:", "exif:lensmake:")):
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _opencv_perspective_correct(source_path: Path, work_dir: Path) -> Optional[Path]:
+    """
+    Detect the sheet-music page boundary and apply a perspective transform to
+    flatten it.  This corrects the camera angle and book-page curl that are
+    common in hand-held photos of hymn books.
+
+    Returns the corrected-image path on success, or None if OpenCV is not
+    installed or no clear page quadrilateral can be found.
+
+    Install: pip install opencv-python-headless numpy
+    """
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+    except ImportError:
+        return None
+
+    img = cv2.imread(str(source_path))
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Edge detection
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    dilated = cv2.dilate(edges, kernel, iterations=2)
+
+    # Find the largest quadrilateral that covers ≥ 20 % of the image area
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    page_quad = None
+    for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:10]:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(cnt) > 0.20 * h * w:
+            page_quad = approx.reshape(4, 2).astype("float32")
+            break
+
+    if page_quad is None:
+        return None  # can't find a clear page boundary
+
+    # Order corners: top-left, top-right, bottom-right, bottom-left
+    s = page_quad.sum(axis=1)
+    d = np.diff(page_quad, axis=1)
+    rect = np.array(
+        [page_quad[np.argmin(s)], page_quad[np.argmin(d)],
+         page_quad[np.argmax(s)], page_quad[np.argmax(d)]],
+        dtype="float32",
+    )
+    tl, tr, br, bl = rect
+
+    out_w = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+    out_h = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+    if out_w < 100 or out_h < 100:
+        return None  # degenerate result
+
+    dst = np.array(
+        [[0, 0], [out_w - 1, 0], [out_w - 1, out_h - 1], [0, out_h - 1]],
+        dtype="float32",
+    )
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(img, M, (out_w, out_h))
+
+    out_dir = work_dir / "omr_dewarp"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{source_path.stem}_dewarped.png"
+    cv2.imwrite(str(out_path), warped)
+    return out_path
+
+
+def _imagemagick_preprocess(source_path: Path, out_path: Path, *, is_photo: bool) -> bool:
+    """
+    Run ImageMagick on source_path → out_path with a pipeline chosen for the
+    input type.
+
+    Clean scan / typeset PDF
+      grayscale → normalize → sharpen
+
+    Camera photo
+      grayscale → auto-level → local adaptive threshold (handles shadows) →
+      median denoise → slight blur+sharpen (recover antialiasing) →
+      deskew (rotation correction) → trim border → density hint
+    """
+    im_bin = _imagemagick_bin()
+    if im_bin is None:
+        return False
+
+    if im_bin == "magick":
+        cmd = ["magick", "convert", str(source_path)]
+    else:
+        cmd = [im_bin, str(source_path)]
+
+    if is_photo:
+        # -lat WxH+offset% : Local Adaptive Threshold — handles uneven lighting
+        # and shadows from book binding without washing out faint note heads.
+        # 80×80 pixel neighbourhood is ~2-3 % of a 3000-pixel-wide phone photo.
+        cmd += [
+            "-colorspace", "Gray",
+            "-auto-level",
+            "-lat", "80x80-5%",
+            "-median", "1",
+            "-blur", "0x0.5",
+            "-sharpen", "0x1.5",
+            "-deskew", "40%",    # correct small rotations / tilt
+            "-trim", "+repage",  # remove uniform (white/black) border strips
+            "-density", "300",
+            "-type", "Grayscale",
+            str(out_path),
+        ]
+    else:
+        cmd += [
+            "-colorspace", "Gray",
+            "-normalize",
+            "-sharpen", "0x1",
+            "-density", "300",
+            "-type", "Grayscale",
+            str(out_path),
+        ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        return result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def preprocess_image_for_omr(source_path: Path, work_dir: Path) -> Path:
     """
-    Return a preprocessed PNG suitable for Audiveris OMR.
+    Return a preprocessed PNG ready for OMR.
 
-    Steps applied when ImageMagick is available:
-      - Convert HEIC/HEIF to PNG (Audiveris cannot read HEIC directly)
-      - Convert to grayscale
-      - Apply auto-level contrast stretch so faint ink becomes crisper
-      - Sharpen slightly to help note-head detection
+    Detects whether the input is a camera photograph or a clean scan and
+    applies the appropriate pipeline:
 
-    Falls back to the original file if ImageMagick is unavailable or conversion
-    fails (Audiveris will still attempt to process the original).
+    • Camera photo  → OpenCV perspective correction (optional, requires
+                       opencv-python-headless) then ImageMagick local adaptive
+                       threshold + deskew + trim.
+    • Clean scan    → ImageMagick grayscale + normalize + sharpen.
+
+    HEIC/HEIF always requires ImageMagick to convert; raises OMRConversionError
+    if it is unavailable.
     """
     ext = file_extension(source_path.name)
     needs_conversion = ext in {"heic", "heif"}
-    im_bin = _imagemagick_bin()
+    is_photo = detect_is_camera_photo(source_path)
 
-    if im_bin is None and not needs_conversion:
-        return source_path  # nothing to do, no tool available
+    im_bin = _imagemagick_bin()
+    if im_bin is None and not needs_conversion and not is_photo:
+        return source_path  # nothing to do
+
+    if im_bin is None:
+        raise OMRConversionError(
+            "HEIC/HEIF images require ImageMagick to convert. "
+            "Install it with: brew install imagemagick"
+        )
+
+    # For camera photos, attempt OpenCV perspective correction first.
+    working_path = source_path
+    if is_photo:
+        dewarped = _opencv_perspective_correct(source_path, work_dir)
+        if dewarped is not None:
+            working_path = dewarped
 
     out_dir = work_dir / "omr_preprocessed"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{source_path.stem}_omr.png"
 
-    if im_bin is None:
-        # ImageMagick absent but file is already a raster format — pass through.
-        return source_path
+    if _imagemagick_preprocess(working_path, out_path, is_photo=is_photo):
+        return out_path
 
-    # Build ImageMagick command:
-    #   -colorspace Gray   → greyscale (reduces noise, speeds OMR)
-    #   -normalize         → stretch contrast to full range
-    #   -sharpen 0x1       → mild unsharp to crisp note heads
-    #   -density 300       → embed 300 dpi hint so Audiveris scales correctly
-    #   -type Grayscale    → ensure output has no colour channels
-    if im_bin == "magick":
-        cmd = [im_bin, "convert", str(source_path)]
-    else:
-        cmd = [im_bin, str(source_path)]
-    cmd += [
-        "-colorspace", "Gray",
-        "-normalize",
-        "-sharpen", "0x1",
-        "-density", "300",
-        "-type", "Grayscale",
-        str(out_path),
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
-        if result.returncode == 0 and out_path.exists():
-            return out_path
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-
-    # Fallback: if ImageMagick failed, at least return original for non-HEIC files.
     if not needs_conversion:
-        return source_path
+        return source_path  # preprocessing failed but original may still work
 
     raise OMRConversionError(
         "HEIC/HEIF images require ImageMagick to convert. "

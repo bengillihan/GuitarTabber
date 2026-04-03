@@ -2,7 +2,7 @@
 
 Web app for generating guitar tabs from MusicXML, PDF, and sheet-image uploads.
 
-`Sheet music -> parse/analyze -> guitar tab -> HTML`
+`Sheet music → OMR / parse → guitar tab → HTML`
 
 ## Run locally
 
@@ -18,23 +18,22 @@ Open `http://127.0.0.1:5000` and upload a sheet music file.
 ## What it does
 
 - Upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`, `.heic`, `.heif`
-- PDF/image OMR conversion via Audiveris (with ImageMagick preprocessing for camera photos)
-- HEIC/HEIF support — iPhone camera photos upload directly (`brew install imagemagick` required)
-- Melody + bass extraction with SATB-aware voice handling
-- Chord labels from explicit MusicXML chord symbols + inferred harmony fallback
+- **MuseScore** (primary OMR) + **Audiveris** (fallback) for PDF/image → MusicXML conversion
+- Camera photo detection with a separate, heavier preprocessing pipeline (see below)
+- SATB-aware voice extraction: lyric-attached part identified as melody source
+- Iterative multi-pass melody extraction: each pass fills in slots missing from earlier passes
+- Chord labels from explicit MusicXML symbols; root-deduplication prevents walking-bass inversions (C/E, C/G…) flooding the display when the chord hasn't changed
 - Measure-grouped tab rows with empty-measure filtering
 - Section/repeat markers (when detected in MusicXML)
-- Playability filter — limits simultaneous fret spans to prevent unplayable positions
+- Playability filter — fret span limit prevents unplayable simultaneous positions
 - Key estimation + capo suggestion
 
 ### Arrangement styles
 
-Choose the style that fits how you want to play the song:
-
 | Style | What's included |
 |---|---|
 | **Melody Only** | Single-note melody line on upper strings; chord labels above |
-| **Chords Only** | Chord voicings + bass root notes; no single-note melody |
+| **Chords Only** | Standard open-position guitar chord shapes from a built-in voicing library; chord labels above |
 | **Fingerstyle** | Melody (upper strings) + alternating bass (lower strings) — classic fingerpicking |
 | **Chords & Melody** | Full chord shapes with melody on top — chord-melody style |
 
@@ -43,27 +42,66 @@ Choose the style that fits how you want to play the song:
 Applied on top of the style:
 
 - **Make Easier** — first-position bias, simplified chord labels, lower fret span, auto-capo to an open key
-- **Standard** — balanced voicings, up to fret 17 on melody
-- **Make More Complete** — adds inner voices, fuller harmonic placement, wider fret range
+- **Standard** — balanced voicings, melody up to fret 17
+- **Make More Complete** — adds inner voices, fuller harmonic placement
 
 ### Arrangement controls
 
 - **Change key** — transpose and preview in any key, or save as a new arrangement
 - **Change style or complexity** — re-render any saved song without re-uploading
 - **Permalink** — every arrangement gets a stable URL
-- **Download .txt** — plain-text tab for copying into your notes app
+- **Download .txt** — plain-text tab
 
-### Tab display controls
+### Tab display
 
 - Text-size slider (8–20 px)
 - Fit-to-screen button — auto-shrinks to avoid horizontal scroll
 
-## PDF / Image Uploads (OMR)
+## PDF / Image / Camera Photo Uploads (OMR)
 
-- PDF and image uploads require [Audiveris](https://github.com/Audiveris/audiveris) for sheet music recognition.
-- Install and ensure `audiveris` is in your `PATH`, or set the `AUDIVERIS_BIN` environment variable.
-- Camera photos (HEIC, JPG) are automatically preprocessed with ImageMagick before OMR — grayscale conversion, contrast normalization, and sharpening improve note detection.
-- If Audiveris is unavailable, MusicXML uploads still work.
+### OMR engines
+
+The app tries OMR engines in this order, stopping at the first success:
+
+1. **MuseScore CLI** — best note and chord-symbol recognition for professionally typeset PDFs.
+   Install: `brew install musescore` (macOS) or download from [musescore.org](https://musescore.org).
+   The app also checks common macOS app bundle paths automatically.
+2. **Audiveris** — fallback for when MuseScore is not installed.
+   Install and add `audiveris` to `PATH`, or set `AUDIVERIS_BIN`.
+
+If neither is installed, MusicXML uploads still work.
+
+### Clean scans vs. camera photos
+
+The app automatically detects whether an uploaded image is a **camera photograph** or a **clean scan / typeset PDF** and applies a different preprocessing pipeline:
+
+| Input type | Detection | Preprocessing |
+|---|---|---|
+| HEIC/HEIF | Always a camera photo | Full camera pipeline |
+| JPG/PNG with EXIF camera metadata (Make/Model) | Camera photo | Full camera pipeline |
+| JPG/PNG without camera EXIF | Clean scan | Scan pipeline |
+
+**Scan pipeline** (ImageMagick): grayscale → normalize → sharpen
+
+**Camera photo pipeline**:
+
+1. **Perspective correction** (optional, requires `opencv-python-headless`): detects the page boundary as a quadrilateral and applies a perspective warp to flatten book curl and correct camera angle
+2. **ImageMagick local adaptive threshold** (`-lat 80x80-5%`): handles uneven lighting and binding shadows without washing out note heads — much more effective than global normalize for photos
+3. Median denoise → sharpen → deskew (rotation correction) → trim borders
+
+To enable perspective correction:
+
+```bash
+pip install opencv-python-headless numpy
+```
+
+Without it, the rest of the camera pipeline still runs and gives meaningful improvement over the scan defaults.
+
+**Tips for better camera photo results:**
+
+- Shoot straight down (directly over the page), not at an angle
+- Use good, even lighting — avoid shadows from your hand or a lamp to one side
+- A flatbed scanner always produces better OMR results than a camera photo
 
 ## Railway Deploy (with Audiveris)
 
@@ -71,6 +109,7 @@ Applied on top of the style:
 - In Railway, deploy from this repo with Docker enabled.
 - Set `DATABASE_URL` from your Postgres service.
 - Set `AUDIVERIS_BIN` only if your binary path differs from `/usr/bin/audiveris`.
+- MuseScore is not included in the Docker image by default; add it to the Dockerfile if needed.
 
 ## Database
 
@@ -82,7 +121,6 @@ Applied on top of the style:
 
 ## Next steps
 
-- Improve fingering/position optimization across phrase context (not just per-slot)
-- Better chord voicing and rhythm grouping for dense piano reductions
-- Add confidence/debug panel (voice selection, detected key/chords, dropped-note reasons)
-- Lyrics display alongside tab to help with placement and chord alignment
+- Add MuseScore to the Railway Dockerfile for production OMR quality
+- Lyrics display alongside tab to help with chord alignment
+- Add confidence/debug panel (detected parts, note counts per pass, key/chord sources)
