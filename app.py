@@ -43,6 +43,10 @@ GUITAR_MAX_MIDI = 79
 CHORD_TEXT_RE = re.compile(
     r"^[A-G](?:b|#)?(?:(?:maj|min|m|dim|aug|sus|add)?\d*)?(?:/[A-G](?:b|#)?)?$"
 )
+CHORD_TEXT_SEARCH_RE = re.compile(
+    r"([A-G](?:b|#)?(?:(?:maj|min|m|dim|aug|sus|add)?\d*)?(?:/[A-G](?:b|#)?)?)",
+    re.IGNORECASE,
+)
 
 
 class TabDifficulty(str, Enum):
@@ -773,6 +777,36 @@ def normalize_chord_label(label: str) -> str:
     return cleaned
 
 
+def extract_chord_token(raw_value: str) -> Optional[str]:
+    raw = (raw_value or "").strip()
+    if not raw:
+        return None
+    match = CHORD_TEXT_SEARCH_RE.search(raw)
+    if not match:
+        return None
+    token = normalize_chord_label(match.group(1))
+    if not token:
+        return None
+
+    def normalize_root(root: str) -> str:
+        if not root:
+            return root
+        if len(root) == 1:
+            return root.upper()
+        return root[0].upper() + root[1:]
+
+    m = re.match(r"^([A-Ga-g](?:b|#)?)(.*)$", token)
+    if not m:
+        return token
+    root, rest = m.groups()
+    root = normalize_root(root)
+    if "/" in rest:
+        left, right = rest.split("/", 1)
+        right = normalize_root(right)
+        return f"{root}{left}/{right}"
+    return f"{root}{rest}"
+
+
 def keep_easy_melody_slot(slot: int, measure_starts: list[int], first_ts: Optional[meter.TimeSignature]) -> bool:
     if not measure_starts:
         return True
@@ -951,28 +985,51 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     played_chord_events: list[tuple[int, list[int]]] = []
     seen_played_slots: set[int] = set()
 
-    # Prefer explicit MusicXML chord symbols when available and preserve labels verbatim.
-    for symbol in score.recurse().getElementsByClass(harmony.ChordSymbol):
-        label = normalize_chord_label(str(getattr(symbol, "figure", "") or "").strip())
-        if not label:
-            continue
-        slot = quarter_to_slot(float(symbol.getOffsetInHierarchy(score)))
+    def add_chord_event(raw_label: str, source_obj: stream.Music21Object) -> None:
+        label = extract_chord_token(raw_label)
+        if not label or not CHORD_TEXT_RE.match(label):
+            return
+        try:
+            slot = quarter_to_slot(float(source_obj.getOffsetInHierarchy(score)))
+        except Exception:
+            # Skip unresolvable offsets to avoid collapsing all labels to slot 0.
+            return
         if slot in seen_chord_slots:
-            continue
+            return
         seen_chord_slots.add(slot)
         chord_events.append((slot, label))
+
+    # Prefer explicit MusicXML chord symbols when available and preserve labels verbatim.
+    for symbol in score.recurse().getElementsByClass(harmony.ChordSymbol):
+        add_chord_event(str(getattr(symbol, "figure", "") or "").strip(), symbol)
 
     # Fallback: many OMR exports parse chord text as generic text expressions.
     for text_item in score.recurse().getElementsByClass(expressions.TextExpression):
         raw_value = str(getattr(text_item, "content", None) or text_item or "").strip()
-        value = normalize_chord_label(raw_value)
-        if not value or not CHORD_TEXT_RE.match(value):
-            continue
-        slot = quarter_to_slot(float(text_item.getOffsetInHierarchy(score)))
-        if slot in seen_chord_slots:
-            continue
-        seen_chord_slots.add(slot)
-        chord_events.append((slot, value))
+        add_chord_event(raw_value, text_item)
+
+    # Additional fallback: some OMR exports chord names as rehearsal marks.
+    for mark in score.recurse().getElementsByClass(expressions.RehearsalMark):
+        raw_value = str(getattr(mark, "content", None) or mark or "").strip()
+        add_chord_event(raw_value, mark)
+
+    # Additional fallback: some OMR exports chord names as note/chord lyrics.
+    for n in score.recurse().notes:
+        raw_lyrics: list[str] = []
+        if isinstance(n, note.Note):
+            if getattr(n, "lyric", None):
+                raw_lyrics.append(str(n.lyric))
+            for lyr in getattr(n, "lyrics", []) or []:
+                text_val = getattr(lyr, "text", None)
+                if text_val:
+                    raw_lyrics.append(str(text_val))
+        elif isinstance(n, chord.Chord):
+            for lyr in getattr(n, "lyrics", []) or []:
+                text_val = getattr(lyr, "text", None)
+                if text_val:
+                    raw_lyrics.append(str(text_val))
+        for raw in raw_lyrics:
+            add_chord_event(raw.strip(), n)
 
     has_explicit_chords = len(chord_events) > 0
 
