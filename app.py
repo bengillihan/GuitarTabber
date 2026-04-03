@@ -10,7 +10,7 @@ from uuid import uuid4
 from flask import Flask, Response, abort, render_template_string, request, url_for
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
-from music21 import chord, converter, harmony, meter, note, pitch, stream
+from music21 import bar, chord, converter, expressions, harmony, meter, note, pitch, stream
 from werkzeug.utils import secure_filename
 
 
@@ -29,7 +29,7 @@ OMR_TIMEOUT_SECONDS = 120
 MEASURES_PER_ROW = 4
 # Approximate max monospace characters (tab columns) per rendered row before wrapping.
 # Row wrapping always happens at measure boundaries.
-TAB_TARGET_CHARS_PER_ROW = 96
+TAB_TARGET_CHARS_PER_ROW = 192
 KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
 
@@ -179,6 +179,13 @@ BASE_PAGE = """
       background: #faf8f1;
       padding: 0.7rem 0.8rem;
       overflow-x: auto;
+    }
+    .tab-notes {
+      color: #6f654d;
+      font-style: italic;
+      white-space: pre;
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      margin-bottom: 0.25rem;
     }
     .tab-chords {
       color: #2e7d32;
@@ -383,11 +390,25 @@ class Arrangement(db.Model):
 
 with app.app_context():
     db.create_all()
-    # Lightweight migration for existing deployments.
-    db.session.execute(
-        text("ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'")
+    # Lightweight migrations for existing deployments.
+    def _safe_add_column(sql_if_not_exists: str, sql_plain: str) -> None:
+        try:
+            db.session.execute(text(sql_if_not_exists))
+        except Exception:
+            try:
+                db.session.execute(text(sql_plain))
+            except Exception:
+                # Already exists or unsupported syntax; continue.
+                pass
+
+    _safe_add_column(
+        "ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'",
+        "ALTER TABLE arrangements ADD COLUMN capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'",
     )
-    db.session.execute(text("ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS tab_html TEXT"))
+    _safe_add_column(
+        "ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS tab_html TEXT",
+        "ALTER TABLE arrangements ADD COLUMN tab_html TEXT",
+    )
     db.session.commit()
 
 
@@ -399,9 +420,9 @@ class ScoreParseError(Exception):
     pass
 
 
-def render_page(body_template: str, **context: object) -> str:
+def render_page(body_template: str, page_title: str = "GuitarTabber", **context: object) -> str:
     body = render_template_string(body_template, **context)
-    return render_template_string(BASE_PAGE, page_title="GuitarTabber", body=body)
+    return render_template_string(BASE_PAGE, page_title=page_title, body=body)
 
 
 def is_allowed_file(filename: str) -> bool:
@@ -515,20 +536,50 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
     return "".join(line).rstrip()
 
 
-def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tuple[int, int]], list[int], list[tuple[int, str]], int, bool]:
+def gather_events(
+    score: stream.Score,
+) -> tuple[
+    list[tuple[int, int]],
+    list[tuple[int, int]],
+    list[int],
+    list[tuple[int, str]],
+    list[tuple[int, str]],
+    int,
+    bool,
+]:
     full_flat = score.flatten()
     parts = list(score.parts)
 
     # Voice-aware extraction for SATB/hymn scores:
-    # melody from first part (typically soprano), bass from last part.
-    melody_source = parts[0].flatten() if parts else full_flat
-    bass_source = parts[-1].flatten() if parts else full_flat
+    # melody from first part voice 1 (soprano), bass from last part voice 2.
+    melody_source = parts[0] if parts else full_flat
+    bass_source = parts[-1] if parts else full_flat
 
-    def collect_part_events(source: stream.Stream, mode: str) -> tuple[list[tuple[int, int]], int]:
+    def choose_voice(source: stream.Stream, preferred_voice: str) -> Optional[str]:
+        voice_ids = {
+            str(voice.id)
+            for voice in source.recurse().getElementsByClass(stream.Voice)
+            if voice.id is not None
+        }
+        if preferred_voice in voice_ids:
+            return preferred_voice
+        if len(voice_ids) == 1:
+            return next(iter(voice_ids))
+        return None
+
+    melody_voice = choose_voice(melody_source, "1")
+    bass_voice = choose_voice(bass_source, "2")
+
+    def collect_part_events(source: stream.Stream, mode: str, voice_filter: Optional[str] = None) -> tuple[list[tuple[int, int]], int]:
         events: list[tuple[int, int]] = []
         max_slot = 0
-        for element in source.notesAndRests:
-            slot = quarter_to_slot(float(element.offset))
+        for element in source.recurse().notesAndRests:
+            if voice_filter is not None:
+                parent_voice = element.getContextByClass(stream.Voice)
+                if parent_voice is None or str(parent_voice.id) != voice_filter:
+                    continue
+
+            slot = quarter_to_slot(float(element.getOffsetInHierarchy(source)))
             max_slot = max(max_slot, slot + 1)
             if isinstance(element, note.Note):
                 events.append((slot, int(element.pitch.midi)))
@@ -538,8 +589,8 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
                     events.append((slot, midi_values[-1] if mode == "high" else midi_values[0]))
         return events, max_slot
 
-    melody_events, melody_max_slot = collect_part_events(melody_source, mode="high")
-    bass_events, bass_max_slot = collect_part_events(bass_source, mode="low")
+    melody_events, melody_max_slot = collect_part_events(melody_source, mode="high", voice_filter=melody_voice)
+    bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
     total_slots = max(melody_max_slot, bass_max_slot)
 
     measure_slots: list[int] = []
@@ -574,6 +625,39 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
 
         beat += 1.0
 
+    # Extract section/repeat markers and map them to measure starts.
+    section_events: list[tuple[int, str]] = []
+    seen_sections: set[tuple[int, str]] = set()
+    for measure in score.recurse().getElementsByClass(stream.Measure):
+        measure_slot = quarter_to_slot(float(measure.offset))
+
+        labels: list[str] = []
+        for mark in measure.recurse().getElementsByClass(expressions.RehearsalMark):
+            value = str(getattr(mark, "content", None) or mark).strip()
+            if value:
+                labels.append(f"[{value}]")
+
+        for text_item in measure.recurse().getElementsByClass(expressions.TextExpression):
+            value = str(getattr(text_item, "content", None) or text_item).strip()
+            lowered = value.lower()
+            if value and len(value) <= 24 and any(ch.isalpha() for ch in value):
+                if any(token in lowered for token in ("refrain", "chorus", "verse", "bridge", "intro", "outro")):
+                    labels.append(f"[{value}]")
+
+        left_bar = measure.leftBarline
+        right_bar = measure.rightBarline
+        if isinstance(left_bar, bar.Repeat) and getattr(left_bar, "direction", None) == "start":
+            labels.append("[|: Repeat]")
+        if isinstance(right_bar, bar.Repeat) and getattr(right_bar, "direction", None) == "end":
+            labels.append("[:| Repeat]")
+
+        for label in labels:
+            key = (measure_slot, label)
+            if key in seen_sections:
+                continue
+            seen_sections.add(key)
+            section_events.append(key)
+
     total_slots = max(total_slots, quarter_to_slot(max_offset) + 1)
     unclamped_slots = max(total_slots + 1, 16)
     was_truncated = unclamped_slots > MAX_SLOTS
@@ -592,10 +676,12 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
         bar_slots = max(1, quarter_to_slot(bar_quarters))
         measure_slots = list(range(0, total_slots, bar_slots))
 
-    return melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated
+    section_events.sort(key=lambda item: item[0])
+    return melody_events, bass_events, measure_slots, chord_events, section_events, total_slots, was_truncated
 
 
-def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]]) -> str:
+def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_note: str = "") -> str:
+    row_note_markup = f'<div class="tab-notes">{html.escape(row_note)}</div>' if row_note else ""
     chord_markup = html.escape(chord_chunk) if chord_chunk else ""
     line_markup: list[str] = []
     for string_name, line_text in row_lines:
@@ -604,6 +690,7 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]]) -> s
         )
     return (
         '<div class="tab-row">'
+        f"{row_note_markup}"
         f'<div class="tab-chords">{chord_markup}</div>'
         f'<div class="tab-strings">{"".join(line_markup)}</div>'
         "</div>"
@@ -611,7 +698,7 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]]) -> s
 
 
 def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
-    melody_events, bass_events, measure_slots, chord_events, total_slots, was_truncated = gather_events(score)
+    melody_events, bass_events, measure_slots, chord_events, section_events, total_slots, was_truncated = gather_events(score)
 
     lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
 
@@ -628,7 +715,7 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
     for slot, midi_value in bass_events:
         if slot >= total_slots:
             continue
-        pos = find_position(midi_value, preferred_strings=[0, 1, 2, 3, 4, 5], max_fret=10)
+        pos = find_position(midi_value, preferred_strings=[0, 1, 2, 3], max_fret=10)
         if pos is None:
             continue
         string_index, fret = pos
@@ -679,9 +766,12 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
         char_start = start_slot * SLOT_WIDTH
         char_end = end_slot * SLOT_WIDTH
         chord_chunk = chord_line[char_start:char_end].rstrip()
+        row_note = "  ".join(label for slot, label in section_events if start_slot <= slot < end_slot)
 
         row_lines: list[tuple[str, str]] = []
         plain_block: list[str] = []
+        if row_note:
+            plain_block.append(row_note)
         if chord_chunk:
             plain_block.append(chord_chunk)
 
@@ -690,7 +780,7 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
             row_lines.append((STRING_NAMES[string_index], f"{chunk}|"))
             plain_block.append(f"{STRING_NAMES[string_index]}|{chunk}|")
 
-        html_rows.append(_build_tab_row_html(chord_chunk, row_lines))
+        html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note))
         plain_rows.append("\n".join(plain_block))
 
     tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
@@ -957,13 +1047,14 @@ def view_arrangement(arrangement_id: int):
     selected_key = row.key_name if row.key_name in key_options else key_options[0]
     transpose_error = None
     transpose_note = None
+    created_label = row.created_at.strftime("%Y-%m-%d %H:%M") if row.created_at else ""
     display = {
         "id": row.id,
         "tab_text": row.tab_text,
         "tab_html": row.tab_html,
         "key_name": row.key_name,
         "capo_suggestion": row.capo_suggestion,
-        "created_at": row.created_at,
+        "created_at": created_label,
         "song_title": row.song_title,
         "original_filename": row.original_filename,
     }
@@ -990,6 +1081,7 @@ def view_arrangement(arrangement_id: int):
 
     return render_page(
         ARRANGEMENT_BODY,
+        page_title=f"{display['song_title']} | GuitarTabber",
         row=SimpleNamespace(**display),
         key_options=key_options,
         selected_key=selected_key,
