@@ -3,12 +3,13 @@ import shutil
 import subprocess
 import html
 import tempfile
+from dataclasses import dataclass
 from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from flask import Flask, Response, abort, render_template_string, request, url_for
+from flask import Flask, Response, abort, redirect, render_template_string, request, url_for
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from music21 import bar, chord, converter, expressions, harmony, meter, note, pitch, stream
@@ -34,6 +35,8 @@ TAB_TARGET_CHARS_PER_ROW = 192
 MAX_FRETTED_SPAN = 5
 KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
+GUITAR_MIN_MIDI = 40
+GUITAR_MAX_MIDI = 79
 
 
 BASE_PAGE = """
@@ -334,7 +337,8 @@ ARRANGEMENT_BODY = """
       <option value="{{ option }}" {% if option == selected_key %}selected{% endif %}>{{ option }}</option>
     {% endfor %}
   </select>
-  <button type="submit">Update Tab</button>
+  <button type="submit" name="transpose_action" value="preview">Update Tab</button>
+  <button type="submit" name="transpose_action" value="save">Save As New Arrangement</button>
 </form>
 {% if transpose_error %}
   <div class="error">{{ transpose_error }}</div>
@@ -390,19 +394,31 @@ class Arrangement(db.Model):
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 
+@dataclass
+class ScoreEvents:
+    melody_events: list[tuple[int, int]]
+    bass_events: list[tuple[int, int]]
+    measure_slots: list[int]
+    chord_events: list[tuple[int, str]]
+    section_events: list[tuple[int, str]]
+    total_slots: int
+    was_truncated: bool
+
+
+def _safe_add_column(sql_if_not_exists: str, sql_plain: str) -> None:
+    try:
+        db.session.execute(text(sql_if_not_exists))
+    except Exception:
+        try:
+            db.session.execute(text(sql_plain))
+        except Exception:
+            # Already exists or unsupported syntax; continue.
+            pass
+
+
 with app.app_context():
     db.create_all()
     # Lightweight migrations for existing deployments.
-    def _safe_add_column(sql_if_not_exists: str, sql_plain: str) -> None:
-        try:
-            db.session.execute(text(sql_if_not_exists))
-        except Exception:
-            try:
-                db.session.execute(text(sql_plain))
-            except Exception:
-                # Already exists or unsupported syntax; continue.
-                pass
-
     _safe_add_column(
         "ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'",
         "ALTER TABLE arrangements ADD COLUMN capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'",
@@ -556,17 +572,7 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
     return "".join(line).rstrip()
 
 
-def gather_events(
-    score: stream.Score,
-) -> tuple[
-    list[tuple[int, int]],
-    list[tuple[int, int]],
-    list[int],
-    list[tuple[int, str]],
-    list[tuple[int, str]],
-    int,
-    bool,
-]:
+def gather_events(score: stream.Score) -> ScoreEvents:
     full_flat = score.flatten()
     parts = list(score.parts)
 
@@ -593,7 +599,8 @@ def gather_events(
     def collect_part_events(source: stream.Stream, mode: str, voice_filter: Optional[str] = None) -> tuple[list[tuple[int, int]], int]:
         events: list[tuple[int, int]] = []
         max_slot = 0
-        for element in source.recurse().notesAndRests:
+        flattened = source.flatten()
+        for element in flattened.notesAndRests:
             if voice_filter is not None:
                 voice_id: Optional[str] = None
                 parent_voice = element.getContextByClass(stream.Voice)
@@ -608,7 +615,7 @@ def gather_events(
                 if voice_id is not None and voice_id != voice_filter:
                     continue
 
-            slot = quarter_to_slot(float(element.getOffsetInHierarchy(source)))
+            slot = quarter_to_slot(float(element.offset))
             max_slot = max(max_slot, slot + 1)
             if isinstance(element, note.Note):
                 events.append((slot, int(element.pitch.midi)))
@@ -652,12 +659,30 @@ def gather_events(
         chord_events.append((slot, label))
 
     max_offset = float(full_flat.highestTime)
+    beat_step = 1.0
+    first_ts = None
+    for ts in score.recurse().getElementsByClass(meter.TimeSignature):
+        first_ts = ts
+        break
+    if first_ts is not None:
+        num = getattr(first_ts, "numerator", None)
+        den = getattr(first_ts, "denominator", None)
+        if isinstance(num, int) and isinstance(den, int) and den == 8 and num % 3 == 0 and num > 3:
+            beat_step = 1.5
+        elif getattr(first_ts, "beatDuration", None) is not None:
+            try:
+                candidate = float(first_ts.beatDuration.quarterLength)
+                if candidate > 0:
+                    beat_step = candidate
+            except Exception:
+                pass
+
     beat = 0.0
     last_inferred_label = ""
     while beat <= max_offset:
         beat_slot = quarter_to_slot(beat)
         if beat_slot in seen_chord_slots:
-            beat += 1.0
+            beat += beat_step
             continue
         vertical = full_flat.notes.getElementsByOffset(beat, mustBeginInSpan=True, includeEndBoundary=False)
         midi_values: list[int] = []
@@ -678,7 +703,7 @@ def gather_events(
                 chord_events.append((beat_slot, label))
                 last_inferred_label = label
 
-        beat += 1.0
+        beat += beat_step
 
     # Extract section/repeat markers and map them to measure starts.
     section_events: list[tuple[int, str]] = []
@@ -732,7 +757,15 @@ def gather_events(
         measure_slots = list(range(0, total_slots, bar_slots))
 
     section_events.sort(key=lambda item: item[0])
-    return melody_events, bass_events, measure_slots, chord_events, section_events, total_slots, was_truncated
+    return ScoreEvents(
+        melody_events=melody_events,
+        bass_events=bass_events,
+        measure_slots=measure_slots,
+        chord_events=chord_events,
+        section_events=section_events,
+        total_slots=total_slots,
+        was_truncated=was_truncated,
+    )
 
 
 def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_note: str = "") -> str:
@@ -753,7 +786,14 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_
 
 
 def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
-    melody_events, bass_events, measure_slots, chord_events, section_events, total_slots, was_truncated = gather_events(score)
+    events = gather_events(score)
+    melody_events = events.melody_events
+    bass_events = events.bass_events
+    measure_slots = events.measure_slots
+    chord_events = events.chord_events
+    section_events = events.section_events
+    total_slots = events.total_slots
+    was_truncated = events.was_truncated
 
     lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
@@ -896,13 +936,19 @@ def parse_key_name(key_name: str) -> Optional[tuple[pitch.Pitch, str]]:
     return tonic, mode
 
 
-def render_score_to_tab_payload(score: stream.Score, title: str, source_label: str) -> dict[str, str]:
-    key_name = "Unknown"
-    try:
-        analyzed_key = score.analyze("key")
-        key_name = f"{analyzed_key.tonic.name} {analyzed_key.mode}"
-    except Exception:
-        pass
+def render_score_to_tab_payload(
+    score: stream.Score,
+    title: str,
+    source_label: str,
+    forced_key_name: Optional[str] = None,
+) -> dict[str, str]:
+    key_name = forced_key_name or "Unknown"
+    if forced_key_name is None:
+        try:
+            analyzed_key = score.analyze("key")
+            key_name = f"{analyzed_key.tonic.name} {analyzed_key.mode}"
+        except Exception:
+            pass
 
     tab_html, tab_plain, was_truncated = arrange_tab(score)
     header = [
@@ -930,19 +976,22 @@ def parse_musicxml_bytes(file_bytes: bytes) -> stream.Score:
     # reliable when parsed from a real file path.
     if file_bytes.startswith(b"PK"):
         temp_path: Optional[str] = None
+        mxl_parse_error: Optional[Exception] = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".mxl", delete=False) as temp_file:
                 temp_file.write(file_bytes)
                 temp_path = temp_file.name
             return converter.parse(temp_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            mxl_parse_error = exc
         finally:
             if temp_path:
                 try:
                     os.unlink(temp_path)
                 except Exception:
                     pass
+        if mxl_parse_error is not None:
+            raise ScoreParseError(f"Saved .mxl source could not be parsed: {mxl_parse_error}") from mxl_parse_error
 
     try:
         return converter.parseData(file_bytes)
@@ -960,10 +1009,29 @@ def transpose_score_between_keys(score: stream.Score, source_key_name: str, targ
         return score
     source_tonic, _ = source
     target_tonic, _ = target
-    semitones = (target_tonic.pitchClass - source_tonic.pitchClass) % 12
-    if semitones > 6:
-        semitones -= 12
-    return score.transpose(semitones, inPlace=False)
+    base = (target_tonic.pitchClass - source_tonic.pitchClass) % 12
+    candidates = [base]
+    if base != 0:
+        candidates.append(base - 12)
+
+    melody_midis = [int(n.pitch.midi) for n in score.recurse().notes if isinstance(n, note.Note)]
+
+    def score_candidate(semitones: int) -> tuple[int, int, int]:
+        out_of_range = 0
+        out_distance = 0
+        if melody_midis:
+            for midi_value in melody_midis:
+                moved = midi_value + semitones
+                if moved < GUITAR_MIN_MIDI:
+                    out_of_range += 1
+                    out_distance += GUITAR_MIN_MIDI - moved
+                elif moved > GUITAR_MAX_MIDI:
+                    out_of_range += 1
+                    out_distance += moved - GUITAR_MAX_MIDI
+        return (out_of_range, out_distance, abs(semitones))
+
+    best = min(candidates, key=score_candidate)
+    return score.transpose(best, inPlace=False)
 
 
 def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict[str, Any]:
@@ -991,11 +1059,17 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
 
     rendered = render_score_to_tab_payload(score, title, source_label)
 
+    ext = parse_paths[0].suffix.lower()
+    output_mime_type = "application/vnd.recordare.musicxml+xml"
+    if ext == ".mxl":
+        output_mime_type = "application/vnd.recordare.musicxml"
+
     return {
         "song_title": title,
         "key_name": rendered["key_name"],
         "capo_suggestion": rendered["capo_suggestion"],
         "musicxml_bytes": parse_paths[0].read_bytes(),
+        "musicxml_mime_type": output_mime_type,
         "truncation_warning": rendered["truncation_warning"],
         "multi_page_warning": multi_page_warning,
         "tab_text": rendered["tab_text"],
@@ -1032,7 +1106,7 @@ def index():
                 song = Song(
                     title=parsed["song_title"],
                     original_filename=safe_name,
-                    mime_type=upload.mimetype or "application/octet-stream",
+                    mime_type=parsed["musicxml_mime_type"],
                     file_data=file_bytes,
                 )
                 db.session.add(song)
@@ -1108,6 +1182,7 @@ def view_arrangement(arrangement_id: int):
     row = (
         db.session.query(
             Arrangement.id.label("id"),
+            Arrangement.song_id.label("song_id"),
             Arrangement.tab_text.label("tab_text"),
             Arrangement.tab_html.label("tab_html"),
             Arrangement.key_name.label("key_name"),
@@ -1132,6 +1207,7 @@ def view_arrangement(arrangement_id: int):
     created_label = row.created_at.strftime("%Y-%m-%d %H:%M") if row.created_at else ""
     display = {
         "id": row.id,
+        "song_id": row.song_id,
         "tab_text": row.tab_text,
         "tab_html": row.tab_html,
         "key_name": row.key_name,
@@ -1143,6 +1219,7 @@ def view_arrangement(arrangement_id: int):
 
     if request.method == "POST":
         selected_key = (request.form.get("target_key") or "").strip()
+        transpose_action = (request.form.get("transpose_action") or "preview").strip().lower()
         if selected_key not in key_options:
             transpose_error = "Please choose a valid target key."
         else:
@@ -1150,15 +1227,32 @@ def view_arrangement(arrangement_id: int):
                 score = parse_musicxml_bytes(row.file_data)
                 transposed = transpose_score_between_keys(score, row.key_name, selected_key)
                 source_label = f"{row.original_filename} (transposed to {selected_key})"
-                rendered = render_score_to_tab_payload(transposed, row.song_title, source_label)
+                rendered = render_score_to_tab_payload(
+                    transposed,
+                    row.song_title,
+                    source_label,
+                    forced_key_name=selected_key,
+                )
                 display["tab_text"] = rendered["tab_text"]
                 display["tab_html"] = rendered["tab_html"]
                 display["key_name"] = rendered["key_name"]
                 display["capo_suggestion"] = rendered["capo_suggestion"]
+                if transpose_action == "save":
+                    new_arrangement = Arrangement(
+                        song_id=row.song_id,
+                        key_name=rendered["key_name"],
+                        capo_suggestion=rendered["capo_suggestion"],
+                        tab_text=rendered["tab_text"],
+                        tab_html=rendered["tab_html"],
+                    )
+                    db.session.add(new_arrangement)
+                    db.session.commit()
+                    return redirect(url_for("view_arrangement", arrangement_id=new_arrangement.id))
                 transpose_note = f"Showing transposed preview in {selected_key}. Saved arrangement remains unchanged."
                 if rendered["truncation_warning"]:
                     transpose_note = f"{transpose_note} {rendered['truncation_warning']}"
             except Exception as exc:
+                db.session.rollback()
                 transpose_error = f"Could not transpose this arrangement: {exc}"
 
     return render_page(
