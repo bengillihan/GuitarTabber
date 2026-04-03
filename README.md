@@ -1,6 +1,6 @@
-# GuitarTabber MVP
+# GuitarTabber
 
-Minimal web app for the first pipeline step:
+Web app for generating first-pass fingerstyle tabs from MusicXML, PDF, and sheet-image uploads.
 
 `MusicXML -> parse/analyze -> simple fingerstyle tab -> HTML`
 
@@ -14,6 +14,22 @@ python3 app.py
 ```
 
 Open `http://127.0.0.1:5000` and upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, or sheet-image files.
+
+## What it does now
+
+- Upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`
+- PDF/image OMR conversion via Audiveris
+- Melody + bass extraction with SATB-aware voice handling
+- Chord labels from explicit MusicXML chord symbols + inferred harmony fallback
+- Measure-grouped tab rows (not one endless line)
+- Section/repeat markers (when detected in MusicXML)
+- Basic playability sanity filter (limits extreme simultaneous fret spans)
+- Key estimation + capo suggestion
+- Arrangement permalink/history + `.txt` download
+- Transpose preview and **Save As New Arrangement**
+- Tab display controls:
+  - text-size slider
+  - fit-to-screen button (auto-shrinks rows to avoid horizontal scroll)
 
 ## PDF/Image Uploads (OMR)
 
@@ -37,19 +53,9 @@ Open `http://127.0.0.1:5000` and upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, or 
 - Tables (`songs`, `arrangements`) are auto-created at app startup.
 - Visit `/history` to revisit saved tab outputs.
 
-## Current scope
-
-- Upload MusicXML, PDF, or sheet images
-- Parse score with `music21`
-- Build a basic arrangement:
-  - melody biased to high strings
-  - bass biased to low strings
-  - lightweight chord labels from vertical sonorities
-- Render ASCII tab in an Ultimate Guitar-style `<pre>` block
-
 ## Next steps
 
-- Improve fingering/position optimization
-- Better chord voicing and rhythm grouping
-- Add section detection (Verse/Chorus)
-- Add transpose + capo suggestions
+- Improve fingering/position optimization across phrase context (not just per-slot)
+- Better chord voicing and rhythm grouping for dense piano reductions
+- Add stronger section labeling (Verse/Chorus/Refrain) from direction text
+- Add confidence/debug panel (voice selection, detected key/chords, dropped-note reasons)

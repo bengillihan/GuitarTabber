@@ -364,7 +364,7 @@ BASE_PAGE = """
 
 HOME_BODY = """
 <div class="topnav">
-  <h1>GuitarTabber MVP</h1>
+  <h1>GuitarTabber</h1>
   <a href="{{ url_for('history') }}">View History</a>
 </div>
 <p>Upload sheet music (MusicXML, PDF, or image) and get a first-pass fingerstyle tab.</p>
@@ -752,11 +752,19 @@ def gather_events(score: stream.Score) -> ScoreEvents:
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
 
     # Fallback: if voice-filtering produces sparse melody (common in imperfect OMR),
-    # fall back to unfiltered first-part melody so the line is still playable.
-    if parts and len(melody_events) < 8:
-        fallback_melody, fallback_max = collect_part_events(parts[0], mode="high", voice_filter=None)
-        if len(fallback_melody) > len(melody_events):
-            melody_events, melody_max_slot = fallback_melody, fallback_max
+    # fall back to unfiltered first-part melody using a relative threshold.
+    if parts:
+        first_part_noteheads = 0
+        for el in parts[0].flatten().notes:
+            if isinstance(el, note.Note):
+                first_part_noteheads += 1
+            elif isinstance(el, chord.Chord):
+                first_part_noteheads += len(el.pitches)
+        sparse_threshold = max(4, int(first_part_noteheads * 0.25))
+        if len(melody_events) < sparse_threshold:
+            fallback_melody, fallback_max = collect_part_events(parts[0], mode="high", voice_filter=None)
+            if len(fallback_melody) > len(melody_events):
+                melody_events, melody_max_slot = fallback_melody, fallback_max
 
     total_slots = max(melody_max_slot, bass_max_slot)
 
@@ -870,10 +878,6 @@ def gather_events(score: stream.Score) -> ScoreEvents:
     # from time signature so wrapping still happens at real measure boundaries.
     if len(measure_slots) <= 1:
         bar_quarters = 4.0
-        first_ts = None
-        for ts in score.recurse().getElementsByClass(meter.TimeSignature):
-            first_ts = ts
-            break
         if first_ts is not None and first_ts.barDuration is not None:
             bar_quarters = float(first_ts.barDuration.quarterLength)
         bar_slots = max(1, quarter_to_slot(bar_quarters))
@@ -910,19 +914,11 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_
 
 def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
     events = gather_events(score)
-    melody_events = events.melody_events
-    bass_events = events.bass_events
-    measure_slots = events.measure_slots
-    chord_events = events.chord_events
-    section_events = events.section_events
-    total_slots = events.total_slots
-    was_truncated = events.was_truncated
-
-    lines = {idx: ["-"] * (total_slots * SLOT_WIDTH) for idx in range(6)}
+    lines = {idx: ["-"] * (events.total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
 
-    for slot, midi_value in melody_events:
-        if slot >= total_slots:
+    for slot, midi_value in events.melody_events:
+        if slot >= events.total_slots:
             continue
         candidates = find_positions(midi_value, preferred_strings=[5, 4, 3, 2], max_fret=14)
         for string_index, fret in candidates:
@@ -935,8 +931,8 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
             slot_fretted_notes.setdefault(slot, []).append(fret)
             break
 
-    for slot, midi_value in bass_events:
-        if slot >= total_slots:
+    for slot, midi_value in events.bass_events:
+        if slot >= events.total_slots:
             continue
         candidates = find_positions(midi_value, preferred_strings=[0, 1, 2, 3], max_fret=10)
         for string_index, fret in candidates:
@@ -949,10 +945,10 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
             slot_fretted_notes.setdefault(slot, []).append(fret)
             break
 
-    place_measure_dividers(lines, measure_slots)
+    place_measure_dividers(lines, events.measure_slots)
 
-    chord_line = build_chord_line(total_slots, chord_events)
-    measure_starts = sorted({slot for slot in measure_slots if 0 <= slot < total_slots})
+    chord_line = build_chord_line(events.total_slots, events.chord_events)
+    measure_starts = sorted({slot for slot in events.measure_slots if 0 <= slot < events.total_slots})
     if not measure_starts or measure_starts[0] != 0:
         measure_starts = [0] + measure_starts
 
@@ -978,10 +974,10 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
         if row_end_idx < len(measure_starts):
             row_end_slot = measure_starts[row_end_idx]
         else:
-            row_end_slot = total_slots
+            row_end_slot = events.total_slots
 
         if row_end_slot <= row_start_slot:
-            row_end_slot = min(total_slots, row_start_slot + 1)
+            row_end_slot = min(events.total_slots, row_start_slot + 1)
 
         row_ranges.append((row_start_slot, row_end_slot))
         idx = row_end_idx
@@ -993,7 +989,7 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
         char_start = start_slot * SLOT_WIDTH
         char_end = end_slot * SLOT_WIDTH
         chord_chunk = chord_line[char_start:char_end].rstrip()
-        row_note = "  ".join(label for slot, label in section_events if start_slot <= slot < end_slot)
+        row_note = "  ".join(label for slot, label in events.section_events if start_slot <= slot < end_slot)
 
         row_lines: list[tuple[str, str]] = []
         plain_block: list[str] = []
@@ -1012,7 +1008,7 @@ def arrange_tab(score: stream.Score) -> tuple[str, str, bool]:
 
     tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
     tab_plain = "\n\n".join(plain_rows)
-    return tab_html, tab_plain, was_truncated
+    return tab_html, tab_plain, events.was_truncated
 
 
 def suggest_capo(key_name: str) -> str:
@@ -1041,7 +1037,12 @@ def suggest_capo(key_name: str) -> str:
 
 
 def build_key_options() -> list[str]:
-    return [f"{tonic} {mode}" for mode in KEY_MODES for tonic in KEY_TONICS]
+    tonic_order = ["C", "G", "D", "A", "E", "B", "F#", "C#", "Ab", "Eb", "Bb", "F"]
+    options: list[str] = []
+    for tonic in tonic_order:
+        options.append(f"{tonic} major")
+        options.append(f"{tonic} minor")
+    return options
 
 
 def parse_key_name(key_name: str) -> Optional[tuple[pitch.Pitch, str]]:
@@ -1137,7 +1138,8 @@ def transpose_score_between_keys(score: stream.Score, source_key_name: str, targ
     if base != 0:
         candidates.append(base - 12)
 
-    melody_midis = [int(n.pitch.midi) for n in score.recurse().notes if isinstance(n, note.Note)]
+    melody_stream: stream.Stream = score.parts[0] if score.parts else score
+    melody_midis = [int(n.pitch.midi) for n in melody_stream.flatten().notes if isinstance(n, note.Note)]
 
     def score_candidate(semitones: int) -> tuple[int, int, int]:
         out_of_range = 0
@@ -1313,7 +1315,6 @@ def view_arrangement(arrangement_id: int):
             Arrangement.created_at.label("created_at"),
             Song.title.label("song_title"),
             Song.original_filename.label("original_filename"),
-            Song.file_data.label("file_data"),
         )
         .join(Song, Arrangement.song_id == Song.id)
         .filter(Arrangement.id == arrangement_id)
@@ -1347,7 +1348,15 @@ def view_arrangement(arrangement_id: int):
             transpose_error = "Please choose a valid target key."
         else:
             try:
-                score = parse_musicxml_bytes(row.file_data)
+                file_data = (
+                    db.session.query(Song.file_data)
+                    .join(Arrangement, Arrangement.song_id == Song.id)
+                    .filter(Arrangement.id == arrangement_id)
+                    .scalar()
+                )
+                if not file_data:
+                    raise ScoreParseError("Stored source file not found for this arrangement.")
+                score = parse_musicxml_bytes(file_data)
                 transposed = transpose_score_between_keys(score, row.key_name, selected_key)
                 source_label = f"{row.original_filename} (transposed to {selected_key})"
                 rendered = render_score_to_tab_payload(
