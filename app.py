@@ -2,11 +2,12 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
-from flask import Flask, abort, render_template_string, request, url_for
+from flask import Flask, Response, abort, render_template_string, request, url_for
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from music21 import chord, converter, harmony, note, pitch, stream
 from werkzeug.utils import secure_filename
 
@@ -168,7 +169,7 @@ HOME_BODY = """
   <h1>GuitarTabber MVP</h1>
   <a href="{{ url_for('history') }}">View History</a>
 </div>
-<p>Upload a MusicXML file and get a first-pass fingerstyle tab.</p>
+<p>Upload sheet music (MusicXML, PDF, or image) and get a first-pass fingerstyle tab.</p>
 <p class="hint">Supported formats: .musicxml, .xml, .mxl, .pdf, .png, .jpg, .jpeg, .webp</p>
 
 {% if omr_warning %}
@@ -190,10 +191,13 @@ HOME_BODY = """
     <h2>{{ result.title }}</h2>
     <p class="meta"><strong>Uploaded file:</strong> {{ result.filename }}</p>
     <p class="meta"><strong>Estimated key:</strong> {{ result.key_name }} | <strong>Capo suggestion:</strong> {{ result.capo_suggestion }}</p>
+    {% if result.multi_page_warning %}
+      <div class="warning">{{ result.multi_page_warning }}</div>
+    {% endif %}
     {% if result.truncation_warning %}
       <div class="warning">{{ result.truncation_warning }}</div>
     {% endif %}
-    <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a></p>
+    <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download .txt</a></p>
     <pre>{{ result.tab }}</pre>
   </section>
 {% endif %}
@@ -238,7 +242,9 @@ ARRANGEMENT_BODY = """
 </div>
 <p class="meta"><strong>Original file:</strong> {{ row.original_filename }}</p>
 <p class="meta"><strong>Estimated key:</strong> {{ row.key_name }}</p>
+<p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
 <p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
+<p class="meta"><a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab as .txt</a></p>
 <pre>{{ row.tab_text }}</pre>
 """
 
@@ -277,12 +283,18 @@ class Arrangement(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     song_id = db.Column(db.Integer, db.ForeignKey("songs.id", ondelete="CASCADE"), nullable=False)
     key_name = db.Column(db.String(80), nullable=False)
+    capo_suggestion = db.Column(db.String(120), nullable=False, default="No suggestion")
     tab_text = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 
 with app.app_context():
     db.create_all()
+    # Lightweight migration for existing deployments.
+    db.session.execute(
+        text("ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS capo_suggestion VARCHAR(120) NOT NULL DEFAULT 'No suggestion'")
+    )
+    db.session.commit()
 
 
 class OMRConversionError(Exception):
@@ -432,7 +444,7 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
                 bass_events.append((slot, midi_values[0]))
 
     measure_slots: list[int] = []
-    for measure in flat.getElementsByClass(stream.Measure):
+    for measure in score.recurse().getElementsByClass(stream.Measure):
         slot = quarter_to_slot(float(measure.offset))
         if slot not in measure_slots:
             measure_slots.append(slot)
@@ -444,13 +456,16 @@ def gather_events(score: stream.Score) -> tuple[list[tuple[int, int]], list[tupl
         beat_slot = quarter_to_slot(beat)
         vertical = flat.notes.getElementsByOffset(beat, mustBeginInSpan=True, includeEndBoundary=False)
         midi_values: list[int] = []
+        durations: list[float] = []
         for item in vertical:
             if isinstance(item, note.Note):
                 midi_values.append(int(item.pitch.midi))
+                durations.append(float(item.quarterLength))
             elif isinstance(item, chord.Chord):
                 midi_values.extend(int(p.midi) for p in item.pitches)
+                durations.append(float(item.quarterLength))
 
-        if len(midi_values) >= 3:
+        if len(midi_values) >= 3 and max(durations or [0.0]) >= 1.0:
             guessed = chord.Chord([pitch.Pitch(midi=v) for v in sorted(set(midi_values))])
             symbol = harmony.chordSymbolFromChord(guessed)
             label = symbol.figure if symbol and symbol.figure else ""
@@ -473,7 +488,7 @@ def arrange_tab(score: stream.Score) -> tuple[str, bool]:
     for slot, midi_value in melody_events:
         if slot >= total_slots:
             continue
-        pos = find_position(midi_value, preferred_strings=[5, 4, 3, 2, 1, 0])
+        pos = find_position(midi_value, preferred_strings=[5, 4, 3, 2], max_fret=14)
         if pos is None:
             continue
         string_index, fret = pos
@@ -509,30 +524,38 @@ def suggest_capo(key_name: str) -> str:
     except ValueError:
         return "No suggestion"
 
-    open_majors = {"C", "G", "D", "A", "E"}
-    open_minors = {"A", "E", "D"}
-    tonic = pitch.Pitch(tonic_name)
+    try:
+        tonic = pitch.Pitch(tonic_name)
+    except Exception:
+        return "No suggestion"
+
+    open_majors_pc = {0: "C", 7: "G", 2: "D", 9: "A", 4: "E"}
+    open_minors_pc = {9: "A", 4: "E", 2: "D"}
 
     for capo in range(0, 8):
-        shifted = pitch.Pitch()
-        shifted.midi = tonic.midi - capo
-        candidate = shifted.name
-        if mode == "major" and candidate in open_majors:
+        target_pc = (tonic.pitchClass - capo) % 12
+        if mode == "major" and target_pc in open_majors_pc:
+            candidate = open_majors_pc[target_pc]
             return "No capo needed" if capo == 0 else f"Capo {capo} (play in {candidate})"
-        if mode == "minor" and candidate in open_minors:
+        if mode == "minor" and target_pc in open_minors_pc:
+            candidate = open_minors_pc[target_pc]
             return "No capo needed" if capo == 0 else f"Capo {capo} (play in {candidate}m)"
     return "No strong capo suggestion"
 
 
-def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict[str, str]:
+def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict[str, Any]:
     parse_paths: list[Path] = [saved_path]
     source_label = safe_name
+    multi_page_warning = ""
     if omr_input_needs_conversion(safe_name):
         parse_paths = convert_sheet_to_musicxml(saved_path, work_dir)
         if len(parse_paths) == 1:
             source_label = f"{safe_name} (via OMR: {parse_paths[0].name})"
         else:
             source_label = f"{safe_name} (via OMR: {len(parse_paths)} exported files, using first)"
+            multi_page_warning = (
+                f"Detected {len(parse_paths)} OMR-exported files. Currently using the first export only."
+            )
 
     try:
         score = converter.parse(str(parse_paths[0]))
@@ -564,11 +587,13 @@ def parse_sheet_to_tab(saved_path: Path, safe_name: str, work_dir: Path) -> dict
         "song_title": title,
         "key_name": key_name,
         "capo_suggestion": capo_suggestion,
+        "musicxml_bytes": parse_paths[0].read_bytes(),
         "truncation_warning": (
             f"This score was truncated for display at {MAX_SLOTS} tab slots. Split into sections for full output."
             if was_truncated
             else ""
         ),
+        "multi_page_warning": multi_page_warning,
         "tab": "\n".join(header) + tab,
     }
 
@@ -598,7 +623,7 @@ def index():
 
             try:
                 parsed = parse_sheet_to_tab(saved_path, safe_name, request_dir)
-                file_bytes = saved_path.read_bytes()
+                file_bytes = parsed["musicxml_bytes"]
                 song = Song(
                     title=parsed["song_title"],
                     original_filename=safe_name,
@@ -611,6 +636,7 @@ def index():
                 arrangement = Arrangement(
                     song_id=song.id,
                     key_name=parsed["key_name"],
+                    capo_suggestion=parsed["capo_suggestion"],
                     tab_text=parsed["tab"],
                 )
                 db.session.add(arrangement)
@@ -622,8 +648,10 @@ def index():
                     "key_name": parsed["key_name"],
                     "capo_suggestion": parsed["capo_suggestion"],
                     "truncation_warning": parsed["truncation_warning"],
+                    "multi_page_warning": parsed["multi_page_warning"],
                     "tab": parsed["tab"],
                     "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
+                    "download_url": url_for("download_arrangement", arrangement_id=arrangement.id),
                 }
             except OMRConversionError as exc:
                 db.session.rollback()
@@ -654,7 +682,19 @@ def history():
         .limit(100)
         .all()
     )
-    return render_page(HISTORY_BODY, rows=rows)
+    formatted_rows = []
+    for row in rows:
+        created_at = row.created_at
+        created_label = created_at.strftime("%Y-%m-%d %H:%M") if created_at else ""
+        formatted_rows.append(
+            {
+                "id": row.id,
+                "song_title": row.song_title,
+                "original_filename": row.original_filename,
+                "created_at": created_label,
+            }
+        )
+    return render_page(HISTORY_BODY, rows=formatted_rows)
 
 
 @app.route("/arrangement/<int:arrangement_id>", methods=["GET"])
@@ -664,6 +704,7 @@ def view_arrangement(arrangement_id: int):
             Arrangement.id.label("id"),
             Arrangement.tab_text.label("tab_text"),
             Arrangement.key_name.label("key_name"),
+            Arrangement.capo_suggestion.label("capo_suggestion"),
             Arrangement.created_at.label("created_at"),
             Song.title.label("song_title"),
             Song.original_filename.label("original_filename"),
@@ -677,6 +718,30 @@ def view_arrangement(arrangement_id: int):
         abort(404)
 
     return render_page(ARRANGEMENT_BODY, row=row)
+
+
+@app.route("/arrangement/<int:arrangement_id>/download", methods=["GET"])
+def download_arrangement(arrangement_id: int):
+    row = (
+        db.session.query(
+            Arrangement.id.label("id"),
+            Arrangement.tab_text.label("tab_text"),
+            Song.title.label("song_title"),
+        )
+        .join(Song, Arrangement.song_id == Song.id)
+        .filter(Arrangement.id == arrangement_id)
+        .first()
+    )
+    if row is None:
+        abort(404)
+
+    safe_title = secure_filename(row.song_title or f"arrangement-{arrangement_id}") or f"arrangement-{arrangement_id}"
+    filename = f"{safe_title}.txt"
+    return Response(
+        row.tab_text,
+        mimetype="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 if __name__ == "__main__":

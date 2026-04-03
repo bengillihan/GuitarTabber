@@ -35,8 +35,9 @@ RUN set -eux; \
     fi; \
     test -n "${AUDIVERIS_DEB_URL}"; \
     curl -fsSL "${AUDIVERIS_DEB_URL}" -o /tmp/audiveris.deb; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends /tmp/audiveris.deb; \
+    # Extract package payload directly to avoid desktop post-install scripts in headless containers.
+    dpkg-deb -x /tmp/audiveris.deb /; \
+    test -x /usr/bin/audiveris; \
     rm -f /tmp/audiveris.deb; \
     rm -rf /var/lib/apt/lists/*
 
