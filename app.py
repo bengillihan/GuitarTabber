@@ -62,7 +62,7 @@ BASE_PAGE = """
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ page_title }}</title>
-  <link rel="icon" type="image/svg+xml" href='data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"%3E%3Ctext y="50" font-size="50"%3E%F0%9F%8E%B8%3C/text%3E%3C/svg%3E'>
+  <link rel="icon" type="image/svg+xml" href='data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"%3E%3Crect width="64" height="64" rx="12" fill="%232e6f40"/%3E%3Ctext x="32" y="41" text-anchor="middle" font-size="26" font-family="Georgia,serif" fill="white"%3EGT%3C/text%3E%3C/svg%3E'>
   <style>
     body {
       margin: 0;
@@ -517,7 +517,7 @@ def normalize_database_url(raw_url: Optional[str]) -> str:
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16 MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # 32 MB upload limit
 raw_db_url = os.getenv("DATABASE_URL") or os.getenv("Database_URL")
 app.config["SQLALCHEMY_DATABASE_URI"] = normalize_database_url(raw_db_url)
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -683,12 +683,22 @@ def quarter_to_slot(quarter_length: float) -> int:
     return max(0, int(round(quarter_length * 4)))
 
 
-def find_position(midi_value: int, preferred_strings: list[int], max_fret: int = 14) -> Optional[tuple[int, int]]:
-    positions = find_positions(midi_value, preferred_strings, max_fret=max_fret)
+def find_position(
+    midi_value: int,
+    preferred_strings: list[int],
+    max_fret: int = 14,
+    prefer_open: bool = True,
+) -> Optional[tuple[int, int]]:
+    positions = find_positions(midi_value, preferred_strings, max_fret=max_fret, prefer_open=prefer_open)
     return positions[0] if positions else None
 
 
-def find_positions(midi_value: int, preferred_strings: list[int], max_fret: int = 14) -> list[tuple[int, int]]:
+def find_positions(
+    midi_value: int,
+    preferred_strings: list[int],
+    max_fret: int = 14,
+    prefer_open: bool = True,
+) -> list[tuple[int, int]]:
     candidates: list[tuple[int, int]] = []
     for string_index in preferred_strings:
         fret = midi_value - STANDARD_TUNING[string_index]
@@ -698,7 +708,10 @@ def find_positions(midi_value: int, preferred_strings: list[int], max_fret: int 
         return []
     # Prefer open strings, then lower frets, then the caller's string priority order.
     priority_index = {s: i for i, s in enumerate(preferred_strings)}
-    candidates.sort(key=lambda c: (0 if c[1] == 0 else 1, c[1], priority_index.get(c[0], 99)))
+    if prefer_open:
+        candidates.sort(key=lambda c: (0 if c[1] == 0 else 1, c[1], priority_index.get(c[0], 99)))
+    else:
+        candidates.sort(key=lambda c: (c[1], priority_index.get(c[0], 99), 0 if c[1] == 0 else 1))
     return candidates
 
 
@@ -784,6 +797,55 @@ def is_valid_chord_label(label: str) -> bool:
         return False
     lowered = cleaned.lower()
     return "cannotbeidentified" not in lowered
+
+
+def pc_to_name(pc: int) -> str:
+    names = {
+        0: "C",
+        1: "C#",
+        2: "D",
+        3: "Eb",
+        4: "E",
+        5: "F",
+        6: "F#",
+        7: "G",
+        8: "Ab",
+        9: "A",
+        10: "Bb",
+        11: "B",
+    }
+    return names.get(pc % 12, "C")
+
+
+def infer_simple_chord_label(midi_values: list[int]) -> str:
+    if not midi_values:
+        return ""
+    pcs = sorted({v % 12 for v in midi_values})
+    if not pcs:
+        return ""
+    bass_pc = min(midi_values) % 12
+
+    best_root = pcs[0]
+    best_quality = ""
+    best_score = -1
+    for root in pcs:
+        major_score = int(((root + 4) % 12) in pcs) + int(((root + 7) % 12) in pcs)
+        minor_score = int(((root + 3) % 12) in pcs) + int(((root + 7) % 12) in pcs)
+        quality = ""
+        score = max(major_score, minor_score)
+        if major_score > minor_score and major_score >= 1:
+            quality = ""
+        elif minor_score > major_score and minor_score >= 1:
+            quality = "m"
+        if score > best_score or (score == best_score and root == bass_pc):
+            best_score = score
+            best_root = root
+            best_quality = quality
+
+    label = f"{pc_to_name(best_root)}{best_quality}"
+    if bass_pc != best_root:
+        label = f"{label}/{pc_to_name(bass_pc)}"
+    return label
 
 
 def extract_chord_token(raw_value: str) -> Optional[str]:
@@ -1247,6 +1309,48 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     section_events.sort(key=lambda item: item[0])
     played_chord_events.sort(key=lambda item: item[0])
+
+    # Final harmonic fallback: derive simple chord labels from played chord
+    # events when explicit symbols/text are sparse or missing.
+    for slot, midi_values in played_chord_events:
+        if slot in seen_chord_slots:
+            continue
+        guessed = normalize_chord_label(infer_simple_chord_label(midi_values))
+        if guessed and is_valid_chord_label(guessed):
+            seen_chord_slots.add(slot)
+            chord_events.append((slot, guessed))
+
+    # Lyric-anchored labels: carry active harmony onto lyric-note slots so
+    # users see chord names where words occur in lead sheets.
+    lyric_slots: set[int] = set()
+    if parts:
+        for n in parts[0].flatten().notes:
+            texts: list[str] = []
+            if isinstance(n, note.Note):
+                if getattr(n, "lyric", None):
+                    texts.append(str(n.lyric))
+                for lyr in getattr(n, "lyrics", []) or []:
+                    text_val = getattr(lyr, "text", None)
+                    if text_val:
+                        texts.append(str(text_val))
+            if any(any(ch.isalpha() for ch in t) for t in texts):
+                lyric_slots.add(quarter_to_slot(float(n.offset)))
+
+    chord_events.sort(key=lambda item: item[0])
+    by_slot_label = {slot: label for slot, label in chord_events}
+    played_by_slot = {slot: midi_values for slot, midi_values in played_chord_events}
+    for slot in sorted(lyric_slots):
+        if slot in by_slot_label:
+            continue
+        prior = [pair for pair in chord_events if pair[0] <= slot]
+        active_label = prior[-1][1] if prior else ""
+        if not active_label and slot in played_by_slot:
+            active_label = normalize_chord_label(infer_simple_chord_label(played_by_slot[slot]))
+        if active_label and is_valid_chord_label(active_label):
+            by_slot_label[slot] = active_label
+
+    chord_events = sorted(by_slot_label.items(), key=lambda item: item[0])
+    chord_events.sort(key=lambda item: item[0])
     return ScoreEvents(
         melody_events=melody_events,
         bass_events=bass_events,
@@ -1321,6 +1425,7 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
 
     lines = {idx: ["-"] * (display_total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
+    last_melody_pos: Optional[tuple[int, int]] = None
     melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 14
     bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 10)
     inner_max_fret = 9 if difficulty == TabDifficulty.EASY else 14
@@ -1342,8 +1447,18 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
         preferred_strings: list[int],
         max_fret: int,
         span_limit: Optional[int] = None,
-    ) -> bool:
-        candidates = find_positions(midi_value, preferred_strings=preferred_strings, max_fret=max_fret)
+        prefer_open: bool = True,
+        near_position: Optional[tuple[int, int]] = None,
+    ) -> Optional[tuple[int, int]]:
+        candidates = find_positions(
+            midi_value,
+            preferred_strings=preferred_strings,
+            max_fret=max_fret,
+            prefer_open=prefer_open,
+        )
+        if near_position is not None and candidates:
+            last_string, last_fret = near_position
+            candidates = sorted(candidates, key=lambda c: (abs(c[1] - last_fret), abs(c[0] - last_string), c[1]))
         for string_index, fret in candidates:
             if not slot_is_free(lines[string_index], slot):
                 continue
@@ -1353,13 +1468,22 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
                 continue
             place_token(lines[string_index], slot, str(fret))
             slot_fretted_notes.setdefault(slot, []).append(fret)
-            return True
-        return False
+            return (string_index, fret)
+        return None
 
     for slot, midi_value in display_melody_events:
         if slot >= display_total_slots:
             continue
-        try_place_midi_at_slot(slot, midi_value, preferred_strings=[5, 4, 3, 2], max_fret=melody_max_fret)
+        placed_pos = try_place_midi_at_slot(
+            slot,
+            midi_value,
+            preferred_strings=[5, 4, 3, 2, 1],
+            max_fret=melody_max_fret,
+            prefer_open=False,
+            near_position=last_melody_pos,
+        )
+        if placed_pos is not None:
+            last_melody_pos = placed_pos
 
     for slot, midi_value in display_bass_events:
         if slot >= display_total_slots:
