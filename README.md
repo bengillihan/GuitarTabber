@@ -22,6 +22,14 @@ Open `http://127.0.0.1:5000` and upload `.musicxml`, `.xml`, `.mxl`, `.pdf`, or 
 - Or set `AUDIVERIS_BIN` to your Audiveris executable path.
 - If Audiveris is unavailable, MusicXML uploads still work.
 
+## Railway Deploy (With Audiveris)
+
+- This repo now includes a `Dockerfile` that installs Audiveris automatically.
+- In Railway, deploy from this repo with Docker enabled (it will build from `Dockerfile`).
+- Keep your `DATABASE_URL` variable set.
+- Optional: set `AUDIVERIS_BIN` only if your binary path differs from `/usr/bin/audiveris`.
+- After deploy, test with a PDF/image upload and check logs for any Audiveris conversion errors.
+
 ## Database
 
 - Railway: set `DATABASE_URL` (or `Database_URL`) from your Postgres service.
