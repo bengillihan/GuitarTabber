@@ -764,6 +764,15 @@ def simplify_chord_label(label: str) -> str:
     return f"{tonic}{'m' if minorish == 'm' else ''}"
 
 
+def normalize_chord_label(label: str) -> str:
+    cleaned = (label or "").strip().replace(" ", "")
+    cleaned = re.sub(r"(?i)power", "", cleaned)
+    cleaned = cleaned.replace("5/", "/")
+    if cleaned.endswith("5") and "/" not in cleaned:
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
 def keep_easy_melody_slot(slot: int, measure_starts: list[int], first_ts: Optional[meter.TimeSignature]) -> bool:
     if not measure_starts:
         return True
@@ -865,8 +874,40 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                 by_slot[slot] = midi_value
         return sorted(by_slot.items()), max_slot
 
+    def collect_lowest_per_slot(source: stream.Stream) -> tuple[list[tuple[int, int]], int]:
+        by_slot: dict[int, int] = {}
+        max_slot = 0
+        for element in source.flatten().notesAndRests:
+            slot = quarter_to_slot(float(element.offset))
+            max_slot = max(max_slot, slot + 1)
+            midi_value: Optional[int] = None
+            if isinstance(element, note.Note):
+                midi_value = int(element.pitch.midi)
+            elif isinstance(element, chord.Chord):
+                midi_values = [int(p.midi) for p in element.pitches]
+                if midi_values:
+                    midi_value = min(midi_values)
+            if midi_value is None:
+                continue
+            current = by_slot.get(slot)
+            if current is None or midi_value < current:
+                by_slot[slot] = midi_value
+        return sorted(by_slot.items()), max_slot
+
+    def collect_verticals(source: stream.Stream) -> dict[int, set[int]]:
+        by_slot: dict[int, set[int]] = {}
+        for item in source.flatten().notes:
+            slot = quarter_to_slot(float(item.offset))
+            bucket = by_slot.setdefault(slot, set())
+            if isinstance(item, note.Note):
+                bucket.add(int(item.pitch.midi))
+            elif isinstance(item, chord.Chord):
+                bucket.update(int(p.midi) for p in item.pitches)
+        return by_slot
+
     melody_events, melody_max_slot = collect_part_events(melody_source, mode="high", voice_filter=melody_voice)
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
+    comp_source: Optional[stream.Stream] = parts[1] if len(parts) >= 3 else None
 
     # In Standard/Complete, prefer "highest note per slot" from top staff to
     # avoid OMR voice-ID mistakes in SATB shared-stem notation.
@@ -875,6 +916,11 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         if top_staff_events:
             melody_events = top_staff_events
             melody_max_slot = max(melody_max_slot, top_staff_max_slot)
+        # Bass voice IDs from OMR are often unreliable; keep lowest note per slot.
+        low_staff_events, low_staff_max_slot = collect_lowest_per_slot(bass_source)
+        if low_staff_events and len(low_staff_events) >= max(3, len(bass_events) // 2):
+            bass_events = low_staff_events
+            bass_max_slot = max(bass_max_slot, low_staff_max_slot)
 
     # Fallback: if voice-filtering produces sparse melody (common in imperfect OMR),
     # fall back to unfiltered first-part melody using a relative threshold.
@@ -907,7 +953,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     # Prefer explicit MusicXML chord symbols when available and preserve labels verbatim.
     for symbol in score.recurse().getElementsByClass(harmony.ChordSymbol):
-        label = str(getattr(symbol, "figure", "") or "").strip()
+        label = normalize_chord_label(str(getattr(symbol, "figure", "") or "").strip())
         if not label:
             continue
         slot = quarter_to_slot(float(symbol.getOffsetInHierarchy(score)))
@@ -919,7 +965,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     # Fallback: many OMR exports parse chord text as generic text expressions.
     for text_item in score.recurse().getElementsByClass(expressions.TextExpression):
         raw_value = str(getattr(text_item, "content", None) or text_item or "").strip()
-        value = raw_value.replace(" ", "")
+        value = normalize_chord_label(raw_value)
         if not value or not CHORD_TEXT_RE.match(value):
             continue
         slot = quarter_to_slot(float(text_item.getOffsetInHierarchy(score)))
@@ -943,7 +989,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         if (not has_explicit_chords) and slot not in seen_chord_slots:
             try:
                 symbol = harmony.chordSymbolFromChord(chord_obj)
-                inferred_label = symbol.figure if symbol and symbol.figure else ""
+                inferred_label = normalize_chord_label(symbol.figure if symbol and symbol.figure else "")
             except Exception:
                 inferred_label = ""
             if inferred_label:
@@ -952,20 +998,24 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
 
     # Also reconstruct vertical lower-staff chords from simultaneous Note objects
     # when OMR does not emit chord.Chord containers.
-    lower_verticals: dict[int, set[int]] = {}
-    for item in bass_source.flatten().notes:
-        slot = quarter_to_slot(float(item.offset))
-        bucket = lower_verticals.setdefault(slot, set())
-        if isinstance(item, note.Note):
-            bucket.add(int(item.pitch.midi))
-        elif isinstance(item, chord.Chord):
-            bucket.update(int(p.midi) for p in item.pitches)
+    lower_verticals = collect_verticals(bass_source)
     for slot, values in lower_verticals.items():
         midi_values = sorted(values)
         if len(midi_values) < 2 or slot in seen_played_slots:
             continue
         seen_played_slots.add(slot)
         played_chord_events.append((slot, midi_values))
+
+    # Add piano-treble accompaniment (middle voice chords) in Standard/Complete.
+    if comp_source is not None and difficulty != TabDifficulty.EASY:
+        comp_verticals = collect_verticals(comp_source)
+        for slot, values in comp_verticals.items():
+            midi_values = sorted(values)
+            if len(midi_values) < 2:
+                continue
+            if slot not in seen_played_slots:
+                seen_played_slots.add(slot)
+                played_chord_events.append((slot, midi_values))
 
     max_offset = float(full_flat.highestTime)
     beat_step = 1.0
@@ -1128,6 +1178,14 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             if not values:
                 continue
             inner_events.append((slot, values[len(values) // 2]))
+    elif difficulty == TabDifficulty.STANDARD and comp_source is not None:
+        comp_verticals = collect_verticals(comp_source)
+        for slot, values in sorted(comp_verticals.items()):
+            midi_values = sorted(values)
+            if len(midi_values) < 2 or slot >= total_slots:
+                continue
+            # Middle chord tone sits well on D/G strings for accompaniment pulse.
+            inner_events.append((slot, midi_values[len(midi_values) // 2]))
 
     section_events.sort(key=lambda item: item[0])
     played_chord_events.sort(key=lambda item: item[0])
@@ -1260,12 +1318,13 @@ def arrange_tab(score: stream.Score, difficulty: TabDifficulty = TabDifficulty.S
                 span_limit=chord_hit_span,
             )
 
-    if difficulty == TabDifficulty.COMPLETE:
+    if difficulty != TabDifficulty.EASY:
         for slot, midi_value in display_inner_events:
             if slot >= display_total_slots:
                 continue
             try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret)
 
+    if difficulty == TabDifficulty.COMPLETE:
         # Try filling implied chord tones at chord-change beats to make fuller voicings.
         for slot, chord_label in display_chord_events:
             if slot >= display_total_slots:
