@@ -63,6 +63,109 @@ class TabStyle(str, Enum):
     CHORDS_AND_MELODY = "chords_and_melody"
 
 
+# Standard open-position guitar chord shapes.
+# Each value is a list of 6 fret numbers (low E → high e).
+# None = string not played.  0 = open string.
+# These are used for the CHORDS style to generate proper guitar voicings
+# instead of trying to place raw bass-staff notes.
+_CHORD_SHAPES: dict[str, list[Optional[int]]] = {
+    # Major
+    "C":   [None, 3, 2, 0, 1, 0],
+    "D":   [None, None, 0, 2, 3, 2],
+    "E":   [0, 2, 2, 1, 0, 0],
+    "F":   [1, 3, 3, 2, 1, 1],
+    "G":   [3, 2, 0, 0, 0, 3],
+    "A":   [None, 0, 2, 2, 2, 0],
+    "B":   [None, 2, 4, 4, 4, 2],
+    "Bb":  [None, 1, 3, 3, 3, 1],
+    "Ab":  [4, 6, 6, 5, 4, 4],
+    "Eb":  [None, None, 1, 3, 4, 3],
+    "Db":  [None, None, 3, 1, 2, 1],
+    "Gb":  [2, 4, 4, 3, 2, 2],
+    # Minor
+    "Cm":  [None, 3, 5, 5, 4, 3],
+    "Dm":  [None, None, 0, 2, 3, 1],
+    "Em":  [0, 2, 2, 0, 0, 0],
+    "Fm":  [1, 3, 3, 1, 1, 1],
+    "Gm":  [3, 5, 5, 3, 3, 3],
+    "Am":  [None, 0, 2, 2, 1, 0],
+    "Bm":  [None, 2, 4, 4, 3, 2],
+    "Bbm": [None, 1, 3, 3, 2, 1],
+    # Dominant 7th
+    "C7":  [None, 3, 2, 3, 1, 0],
+    "D7":  [None, None, 0, 2, 1, 2],
+    "E7":  [0, 2, 0, 1, 0, 0],
+    "F7":  [1, 3, 1, 2, 1, 1],
+    "G7":  [3, 2, 0, 0, 0, 1],
+    "A7":  [None, 0, 2, 0, 2, 0],
+    "B7":  [None, 2, 1, 2, 0, 2],
+    # Major 7th
+    "Cmaj7": [None, 3, 2, 0, 0, 0],
+    "Dmaj7": [None, None, 0, 2, 2, 2],
+    "Emaj7": [0, 2, 1, 1, 0, 0],
+    "Fmaj7": [1, 3, 2, 2, 1, 0],
+    "Gmaj7": [3, 2, 0, 0, 0, 2],
+    "Amaj7": [None, 0, 2, 1, 2, 0],
+    # Minor 7th
+    "Am7":  [None, 0, 2, 0, 1, 0],
+    "Dm7":  [None, None, 0, 2, 1, 1],
+    "Em7":  [0, 2, 2, 0, 3, 0],
+    "Bm7":  [None, 2, 4, 2, 3, 2],
+    # Suspended
+    "Csus2":  [None, 3, 0, 0, 1, 3],
+    "Gsus4":  [3, 3, 0, 0, 1, 3],
+    "Asus4":  [None, 0, 2, 2, 3, 0],
+    # Common slash chords
+    "G/D":  [None, None, 0, 0, 0, 3],
+    "G/B":  [None, 2, 0, 0, 0, 3],
+    "G7/B": [None, 2, 0, 0, 0, 1],
+    "C/E":  [0, 3, 2, 0, 1, 0],
+    "C/G":  [3, 3, 2, 0, 1, 0],
+    "D/F#": [2, None, 0, 2, 3, 2],
+    "F/C":  [None, 3, 3, 2, 1, 1],
+    "A/C#": [None, 4, 2, 2, 2, 0],
+    "E/G#": [4, None, 2, 1, 0, 0],
+}
+
+
+def chord_label_to_midi(label: str) -> list[int]:
+    """
+    Return MIDI note values for the standard guitar voicing of `label`.
+    Falls back to music21 chord construction if no shape is in the library.
+    Returns an empty list if the chord cannot be resolved.
+    """
+    # Direct lookup, then try stripping quality variations.
+    shape = _CHORD_SHAPES.get(label)
+    if shape is None:
+        # Try the root only (e.g. "C#" → look for "Db" enharmonic).
+        root_only = re.match(r"^([A-G][b#]?)(.*)$", label)
+        if root_only:
+            root, quality = root_only.groups()
+            # Enharmonic mapping for roots.
+            enharmonic = {"C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
+                          "Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
+            alt_root = enharmonic.get(root)
+            if alt_root:
+                shape = _CHORD_SHAPES.get(f"{alt_root}{quality}")
+
+    if shape is not None:
+        midi_values: list[int] = []
+        for string_index, fret in enumerate(shape):
+            if fret is None:
+                continue
+            midi_values.append(STANDARD_TUNING[string_index] + fret)
+        return midi_values
+
+    # Library miss — fall back to music21 chord construction.
+    try:
+        sym = harmony.ChordSymbol(label)
+        pitches = [int(p.midi) for p in sym.pitches]
+        # Build a rough 6-string voicing from the chord tones.
+        return pitches[:6] if pitches else []
+    except Exception:
+        return []
+
+
 BASE_PAGE = """
 <!doctype html>
 <html lang="en">
@@ -698,9 +801,10 @@ def omr_input_needs_conversion(filename: str) -> bool:
 
 
 def is_omr_available() -> bool:
+    if find_musescore_bin() is not None:
+        return True
     audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
-    resolved = shutil.which(audiveris_bin)
-    return resolved is not None
+    return shutil.which(audiveris_bin) is not None
 
 
 def collect_generated_musicxml(output_dir: Path) -> list[Path]:
@@ -787,6 +891,67 @@ def preprocess_image_for_omr(source_path: Path, work_dir: Path) -> Path:
     )
 
 
+def find_musescore_bin() -> Optional[str]:
+    """
+    Return the MuseScore CLI executable path, or None if not installed.
+    Checks PATH entries and common macOS/Linux/Windows install locations.
+    """
+    # Common PATH names
+    for candidate in ("mscore", "musescore", "mscore4", "mscore3", "MuseScore4", "MuseScore3"):
+        if shutil.which(candidate):
+            return shutil.which(candidate)
+
+    # macOS app bundle locations
+    mac_paths = [
+        "/Applications/MuseScore 4.app/Contents/MacOS/mscore",
+        "/Applications/MuseScore 3.app/Contents/MacOS/mscore",
+        "/Applications/MuseScore4.app/Contents/MacOS/mscore",
+        "/Applications/MuseScore3.app/Contents/MacOS/mscore",
+    ]
+    for p in mac_paths:
+        if Path(p).exists():
+            return p
+
+    # Linux flatpak / snap
+    for candidate in ("/usr/bin/mscore", "/usr/bin/musescore", "/usr/local/bin/mscore"):
+        if Path(candidate).exists():
+            return candidate
+
+    return None
+
+
+def convert_with_musescore(source_path: Path, work_dir: Path) -> Optional[Path]:
+    """
+    Use MuseScore CLI to convert a PDF or image to MusicXML.
+    Returns the output MusicXML path on success, None on failure.
+    MuseScore produces far more accurate note recognition than Audiveris
+    for professionally typeset sheet music PDFs.
+    """
+    ms_bin = find_musescore_bin()
+    if ms_bin is None:
+        return None
+
+    output_dir = work_dir / "ms_exports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{source_path.stem}.musicxml"
+
+    cmd = [ms_bin, "-o", str(output_path), str(source_path)]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS
+        )
+        if output_path.exists() and output_path.stat().st_size > 0:
+            return output_path
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # MuseScore sometimes writes the file even on non-zero exit; check again.
+    if output_path.exists() and output_path.stat().st_size > 0:
+        return output_path
+
+    return None
+
+
 def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path]:
     gs_bin = shutil.which("gs")
     if gs_bin is None:
@@ -813,13 +978,24 @@ def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path
 
 
 def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
-    """Convert PDF/image sheet music to MusicXML using Audiveris."""
-    audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
+    """
+    Convert PDF/image sheet music to MusicXML.
 
-    # Preprocess camera/phone images before handing to Audiveris.
-    # This converts HEIC → PNG and applies contrast enhancement for all images.
+    Strategy (most accurate first):
+      1. MuseScore CLI  — best note/chord-symbol recognition for typeset PDFs
+      2. Audiveris      — fallback when MuseScore is not installed
+    """
+    # --- MuseScore (primary, most accurate) ---
+    ms_result = convert_with_musescore(source_path, work_dir)
+    if ms_result is not None:
+        return [ms_result]
+
+    # --- Preprocess camera/phone images before handing to Audiveris. ---
+    # Converts HEIC → PNG and applies contrast enhancement.
     if file_extension(source_path.name) in IMAGE_EXTENSIONS:
         source_path = preprocess_image_for_omr(source_path, work_dir)
+
+    audiveris_bin = os.getenv("AUDIVERIS_BIN", "audiveris")
 
     output_dir = work_dir / "omr_exports"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1254,44 +1430,49 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             bass_events = low_staff_events
             bass_max_slot = max(bass_max_slot, low_staff_max_slot)
 
-    # Fallback: if voice-filtering produces sparse melody (common in imperfect OMR),
-    # try progressively broader sources until we get enough notes.
+    # --- Iterative multi-pass melody improvement ---
+    # Each pass targets a different extraction strategy. Rather than replacing
+    # earlier results wholesale, we MERGE: keeping already-found notes and
+    # filling in slots that are still empty.  This mirrors the "multiple passes
+    # looking for different things" idea — each pass contributes what it finds
+    # best and doesn't clobber work done by a more accurate earlier pass.
+
+    def merge_melody(base: list[tuple[int, int]], additions: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Return base with any slots from additions that base doesn't already cover."""
+        covered = {s for s, _ in base}
+        extras = [(s, m) for s, m in additions if s not in covered]
+        return sorted(base + extras, key=lambda x: x[0])
+
     if parts:
-        # Count total noteheads in the score as a reference for "sparse".
         all_noteheads = sum(
             1 if isinstance(el, note.Note) else len(el.pitches)
             for el in full_flat.notes
         )
         sparse_threshold = max(4, int(all_noteheads * 0.05))
 
+        # Pass 1: unfiltered melody source (keeps lyric-part notes, no voice filter).
         if len(melody_events) < sparse_threshold:
-            # Try unfiltered melody source first.
-            fallback_melody, fallback_max = collect_part_events(melody_source, mode="high", voice_filter=None)
-            if len(fallback_melody) > len(melody_events):
-                melody_events, melody_max_slot = fallback_melody, fallback_max
+            p1, p1_max = collect_part_events(melody_source, mode="high", voice_filter=None)
+            melody_events = merge_melody(melody_events, p1)
+            melody_max_slot = max(melody_max_slot, p1_max)
 
-        if len(melody_events) < sparse_threshold:
-            # Try every part independently; pick the one richest in melody-range notes.
-            best_candidate: list[tuple[int, int]] = melody_events
-            best_max = melody_max_slot
-            for part in parts:
-                candidate, candidate_max = collect_highest_per_slot(part)
-                if _melody_note_count(part) > _melody_note_count(melody_source) and len(candidate) > len(best_candidate):
-                    best_candidate = candidate
-                    best_max = candidate_max
-            if best_candidate is not melody_events:
-                melody_events, melody_max_slot = best_candidate, best_max
+        # Pass 2: highest-per-slot from every part; fill in any still-missing slots.
+        for part in parts:
+            candidate, candidate_max = collect_highest_per_slot(part)
+            melody_events = merge_melody(melody_events, candidate)
+            melody_max_slot = max(melody_max_slot, candidate_max)
+            if len(melody_events) >= sparse_threshold * 4:
+                break  # enough notes; stop adding inner-voice noise
 
-        if len(melody_events) < sparse_threshold:
-            # Last resort: collect highest note per slot across ALL treble parts.
-            all_treble_slots: dict[int, int] = {}
-            for part in parts[:-1]:  # exclude last part (bass)
-                for s, midi_val in collect_highest_per_slot(part)[0]:
-                    if s not in all_treble_slots or midi_val > all_treble_slots[s]:
-                        all_treble_slots[s] = midi_val
-            if len(all_treble_slots) > len(melody_events):
-                melody_events = sorted(all_treble_slots.items())
-                melody_max_slot = max((s for s in all_treble_slots), default=melody_max_slot) + 1
+        # Pass 3: global highest across all treble parts — catches anything still missing.
+        all_treble_slots: dict[int, int] = {}
+        for part in parts[:-1]:
+            for s, midi_val in collect_highest_per_slot(part)[0]:
+                if s not in all_treble_slots or midi_val > all_treble_slots[s]:
+                    all_treble_slots[s] = midi_val
+        melody_events = merge_melody(melody_events, list(all_treble_slots.items()))
+        if all_treble_slots:
+            melody_max_slot = max(melody_max_slot, max(all_treble_slots) + 1)
 
     total_slots = max(melody_max_slot, bass_max_slot)
 
@@ -1791,24 +1972,46 @@ def arrange_tab(
             try_place_midi_at_slot(slot, midi_value, preferred_strings=[0, 1, 2, 3], max_fret=bass_max_fret)
 
     if place_chords:
-        # For CHORDS_AND_MELODY use all 6 strings; for others, avoid high e (melody string).
         chord_strings = [0, 1, 2, 3, 4, 5] if style == TabStyle.CHORDS_AND_MELODY else (
             [0, 1, 2, 3, 4, 5] if difficulty == TabDifficulty.COMPLETE else [0, 1, 2, 3, 4]
         )
-        for slot, midi_values in display_played_chord_events:
-            if slot >= display_total_slots:
-                continue
-            unique_values = sorted({normalize_midi_to_guitar_range(v) for v in midi_values})
-            if chord_note_limit is not None and len(unique_values) > chord_note_limit:
-                unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
-            for midi_value in unique_values:
-                try_place_midi_at_slot(
-                    slot,
-                    midi_value,
-                    preferred_strings=chord_strings,
-                    max_fret=chord_hit_max_fret,
-                    span_limit=chord_hit_span,
-                )
+
+        if style == TabStyle.CHORDS:
+            # Use the standard guitar chord shape library for each labeled chord change.
+            # This gives clean, playable open-position voicings rather than trying to
+            # reconstruct shapes from detected bass notes.
+            placed_chord_slots: set[int] = set()
+            for slot, chord_label in display_chord_events:
+                if slot >= display_total_slots or slot in placed_chord_slots:
+                    continue
+                shape_midi = chord_label_to_midi(chord_label)
+                if not shape_midi:
+                    continue
+                placed_chord_slots.add(slot)
+                for midi_value in shape_midi:
+                    try_place_midi_at_slot(
+                        slot,
+                        midi_value,
+                        preferred_strings=chord_strings,
+                        max_fret=chord_hit_max_fret,
+                        span_limit=chord_hit_span,
+                    )
+        else:
+            # FINGERSTYLE / CHORDS_AND_MELODY: use detected score notes for texture.
+            for slot, midi_values in display_played_chord_events:
+                if slot >= display_total_slots:
+                    continue
+                unique_values = sorted({normalize_midi_to_guitar_range(v) for v in midi_values})
+                if chord_note_limit is not None and len(unique_values) > chord_note_limit:
+                    unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
+                for midi_value in unique_values:
+                    try_place_midi_at_slot(
+                        slot,
+                        midi_value,
+                        preferred_strings=chord_strings,
+                        max_fret=chord_hit_max_fret,
+                        span_limit=chord_hit_span,
+                    )
 
     if place_inner or (style == TabStyle.FINGERSTYLE and difficulty != TabDifficulty.EASY):
         for slot, midi_value in display_inner_events:
