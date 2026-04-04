@@ -537,7 +537,7 @@ HOME_BODY = """
     {% if result.truncation_warning %}
       <div class="warning">{{ result.truncation_warning }}</div>
     {% endif %}
-<p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download .txt</a></p>
+<p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download tab (.txt)</a> | <a href="{{ result.download_original_url }}">Download original file</a></p>
     <div class="tab-controls">
       <label>Tab text size: <span class="tab-size-value">15.0</span>px</label>
       <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
@@ -590,7 +590,10 @@ ARRANGEMENT_BODY = """
 <p class="meta"><strong>Style:</strong> {{ row.style_label }} &nbsp;|&nbsp; <strong>Complexity:</strong> {{ row.difficulty_label }}</p>
 <p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
 <p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
-<p class="meta"><a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab as .txt</a></p>
+<p class="meta">
+  <a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab (.txt)</a>
+  {% if row.has_original %} | <a href="{{ url_for('download_original', arrangement_id=row.id) }}">Download original file ({{ row.original_filename }})</a>{% endif %}
+</p>
 <form method="post" class="transpose-form">
   <label for="target_key"><strong>Key:</strong></label>
   <select id="target_key" name="target_key">
@@ -668,6 +671,8 @@ class Song(db.Model):
     original_filename = db.Column(db.String(255), nullable=False)
     mime_type = db.Column(db.String(120), nullable=False)
     file_data = db.Column(db.LargeBinary, nullable=False)
+    original_file_data = db.Column(db.LargeBinary, nullable=True)
+    original_file_mime_type = db.Column(db.String(120), nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 
@@ -727,6 +732,14 @@ with app.app_context():
     _safe_add_column(
         f"ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS style VARCHAR(30) NOT NULL DEFAULT '{TabStyle.FINGERSTYLE.value}'",
         f"ALTER TABLE arrangements ADD COLUMN style VARCHAR(30) NOT NULL DEFAULT '{TabStyle.FINGERSTYLE.value}'",
+    )
+    _safe_add_column(
+        "ALTER TABLE songs ADD COLUMN IF NOT EXISTS original_file_data BYTEA",
+        "ALTER TABLE songs ADD COLUMN original_file_data BLOB",
+    )
+    _safe_add_column(
+        "ALTER TABLE songs ADD COLUMN IF NOT EXISTS original_file_mime_type VARCHAR(120)",
+        "ALTER TABLE songs ADD COLUMN original_file_mime_type VARCHAR(120)",
     )
     db.session.commit()
 
@@ -793,6 +806,27 @@ def file_extension(filename: str) -> str:
     if "." not in filename:
         return ""
     return filename.rsplit(".", 1)[1].lower()
+
+
+_EXT_TO_MIME: dict[str, str] = {
+    "pdf": "application/pdf",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+    "tif": "image/tiff",
+    "tiff": "image/tiff",
+    "heic": "image/heic",
+    "heif": "image/heif",
+    "musicxml": "application/vnd.recordare.musicxml+xml",
+    "xml": "application/xml",
+    "mxl": "application/vnd.recordare.musicxml",
+}
+
+
+def ext_to_mime(ext: str) -> str:
+    return _EXT_TO_MIME.get(ext.lower(), "application/octet-stream")
 
 
 def omr_input_needs_conversion(filename: str) -> bool:
@@ -2568,6 +2602,8 @@ def index():
             safe_name = secure_filename(upload.filename)
             saved_path = request_dir / safe_name
             upload.save(saved_path)
+            original_bytes = saved_path.read_bytes()
+            original_mime = ext_to_mime(file_extension(safe_name))
 
             try:
                 parsed = parse_sheet_to_tab(saved_path, safe_name, request_dir, difficulty=selected_difficulty, style=selected_style)
@@ -2577,6 +2613,8 @@ def index():
                     original_filename=safe_name,
                     mime_type=parsed["musicxml_mime_type"],
                     file_data=file_bytes,
+                    original_file_data=original_bytes,
+                    original_file_mime_type=original_mime,
                 )
                 db.session.add(song)
                 db.session.flush()
@@ -2605,6 +2643,7 @@ def index():
                     "tab_html": parsed["tab_html"],
                     "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
                     "download_url": url_for("download_arrangement", arrangement_id=arrangement.id),
+                    "download_original_url": url_for("download_original", arrangement_id=arrangement.id),
                 }
             except OMRConversionError as exc:
                 db.session.rollback()
@@ -2675,6 +2714,7 @@ def view_arrangement(arrangement_id: int):
             Arrangement.created_at.label("created_at"),
             Song.title.label("song_title"),
             Song.original_filename.label("original_filename"),
+            (Song.original_file_data != None).label("has_original"),  # noqa: E711
         )
         .join(Song, Arrangement.song_id == Song.id)
         .filter(Arrangement.id == arrangement_id)
@@ -2705,6 +2745,7 @@ def view_arrangement(arrangement_id: int):
         "created_at": created_label,
         "song_title": row.song_title,
         "original_filename": row.original_filename,
+        "has_original": bool(row.has_original),
     }
 
     if request.method == "POST":
@@ -2802,6 +2843,28 @@ def download_arrangement(arrangement_id: int):
         row.tab_text,
         mimetype="text/plain; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.route("/arrangement/<int:arrangement_id>/download/original", methods=["GET"])
+def download_original(arrangement_id: int):
+    row = (
+        db.session.query(
+            Song.original_filename.label("original_filename"),
+            Song.original_file_data.label("original_file_data"),
+            Song.original_file_mime_type.label("original_file_mime_type"),
+        )
+        .join(Arrangement, Arrangement.song_id == Song.id)
+        .filter(Arrangement.id == arrangement_id)
+        .first()
+    )
+    if row is None or not row.original_file_data:
+        abort(404)
+
+    return Response(
+        row.original_file_data,
+        mimetype=row.original_file_mime_type or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{row.original_filename}"'},
     )
 
 
