@@ -1717,6 +1717,32 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             melody_events = merge_melody(melody_events, lyric_melody)
             melody_max_slot = max(melody_max_slot, lyric_melody_max)
 
+        # Final melody recovery: ensure lyric-carrying time slots have a melody
+        # note, even if OMR voice IDs are inconsistent. Pull from full-score
+        # verticals at that slot (treble range only) when needed.
+        lyric_slots = {s for s, _ in lyric_events}
+        present_slots = {s for s, _ in melody_events}
+        recovered: list[tuple[int, int]] = []
+        for slot in sorted(lyric_slots - present_slots):
+            offset = slot / 4.0
+            vertical = full_flat.notes.getElementsByOffset(
+                offset,
+                mustBeginInSpan=True,
+                includeEndBoundary=False,
+            )
+            candidates: list[int] = []
+            for item in vertical:
+                if isinstance(item, note.Note):
+                    candidates.append(int(item.pitch.midi))
+                elif isinstance(item, chord.Chord):
+                    candidates.extend(int(p.midi) for p in item.pitches)
+            candidates = [m for m in candidates if 55 <= m <= 84]
+            if candidates:
+                recovered.append((slot, max(candidates)))
+        if recovered:
+            melody_events = merge_melody(melody_events, recovered)
+            melody_max_slot = max(melody_max_slot, max(s for s, _ in recovered) + 1)
+
         if has_lyric_part:
             # A vocal part was identified by lyrics — trust it exclusively.
             # Merging from other parts pulls in piano accompaniment patterns
@@ -2171,9 +2197,11 @@ def arrange_tab(
     melody_max_fret = 5 if difficulty == TabDifficulty.EASY else (17 if difficulty == TabDifficulty.COMPLETE else 14)
     bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (11 if difficulty == TabDifficulty.COMPLETE else 8)
     inner_max_fret = 9 if difficulty == TabDifficulty.EASY else (14 if difficulty == TabDifficulty.COMPLETE else 10)
-    max_span = 3 if difficulty == TabDifficulty.EASY else MAX_FRETTED_SPAN
+    # Keep simultaneous shapes physically plausible; this is a hard limiter
+    # against impossible wide grabs in generated fingerstyle/chord-melody.
+    max_span = 3 if difficulty == TabDifficulty.EASY else 4
     chord_hit_span = max_span
-    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 8)
+    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else (10 if difficulty == TabDifficulty.COMPLETE else 8)
 
     def normalize_midi_to_guitar_range(midi_value: int) -> int:
         moved = int(midi_value)
@@ -2242,6 +2270,9 @@ def arrange_tab(
             if placed_pos is not None:
                 last_melody_pos = placed_pos
 
+    melody_slots = {slot for slot, _ in display_melody_events if 0 <= slot < display_total_slots}
+    bass_slots = {slot for slot, _ in display_bass_events if 0 <= slot < display_total_slots}
+
     if place_bass:
         for slot, midi_value in display_bass_events:
             if slot >= display_total_slots:
@@ -2278,14 +2309,25 @@ def arrange_tab(
             for slot, midi_values in display_played_chord_events:
                 if slot >= display_total_slots:
                     continue
+                # When melody is present at the same beat, keep accompaniment
+                # on lower strings so the top-line melody remains intact/audible.
+                active_strings = chord_strings
+                if slot in melody_slots and style != TabStyle.CHORDS:
+                    active_strings = [0, 1, 2, 3]
+
                 unique_values = sorted({normalize_midi_to_guitar_range(v) for v in midi_values})
+                # Favor compact accompaniment: avoid dense vertical stacks that
+                # fight melody and lead to unplayable grips.
+                if slot in melody_slots:
+                    if unique_values:
+                        unique_values = [unique_values[0], unique_values[-1]] if len(unique_values) >= 2 else unique_values
                 if chord_note_limit is not None and len(unique_values) > chord_note_limit:
                     unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
                 for midi_value in unique_values:
                     try_place_midi_at_slot(
                         slot,
                         midi_value,
-                        preferred_strings=chord_strings,
+                        preferred_strings=active_strings,
                         max_fret=chord_hit_max_fret,
                         span_limit=chord_hit_span,
                     )
@@ -2296,8 +2338,8 @@ def arrange_tab(
                 continue
             try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret, span_limit=max_span)
 
-    if difficulty == TabDifficulty.COMPLETE and style in (TabStyle.CHORDS, TabStyle.CHORDS_AND_MELODY, TabStyle.FINGERSTYLE):
-        # Try filling implied chord tones at chord-change beats to make fuller voicings.
+    if difficulty == TabDifficulty.COMPLETE and style in (TabStyle.CHORDS,):
+        # In complete + chords-only mode, a little extra fill is okay.
         for slot, chord_label in display_chord_events:
             if slot >= display_total_slots:
                 continue
@@ -2306,8 +2348,14 @@ def arrange_tab(
                 chord_midis = [int(p.midi) for p in symbol.pitches]
             except Exception:
                 continue
-            for midi_value in chord_midis[:4]:
-                try_place_midi_at_slot(slot, midi_value, preferred_strings=[2, 3, 1, 4, 0, 5], max_fret=inner_max_fret)
+            for midi_value in chord_midis[:3]:
+                try_place_midi_at_slot(
+                    slot,
+                    midi_value,
+                    preferred_strings=[2, 3, 1, 4, 0, 5],
+                    max_fret=inner_max_fret,
+                    span_limit=chord_hit_span,
+                )
 
     place_measure_dividers(lines, display_measure_slots)
 
