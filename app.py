@@ -1601,6 +1601,40 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                 by_slot[slot] = midi_value
         return sorted(by_slot.items()), max_slot
 
+    def collect_lyric_melody(source: stream.Stream) -> tuple[list[tuple[int, int]], int]:
+        """Collect melody notes that explicitly carry lyric syllables."""
+        by_slot: dict[int, int] = {}
+        max_slot = 0
+        for n in source.flatten().notes:
+            texts: list[str] = []
+            if isinstance(n, note.Note):
+                if getattr(n, "lyric", None):
+                    texts.append(str(n.lyric))
+                for lyr in getattr(n, "lyrics", []) or []:
+                    text_val = getattr(lyr, "text", None)
+                    if text_val:
+                        texts.append(str(text_val))
+                midi_val = int(n.pitch.midi)
+            elif isinstance(n, chord.Chord):
+                for lyr in getattr(n, "lyrics", []) or []:
+                    text_val = getattr(lyr, "text", None)
+                    if text_val:
+                        texts.append(str(text_val))
+                midi_values = [int(p.midi) for p in n.pitches]
+                if not midi_values:
+                    continue
+                midi_val = max(midi_values)
+            else:
+                continue
+            if not any(any(ch.isalpha() for ch in t) for t in texts):
+                continue
+            slot = quarter_to_slot(float(n.offset))
+            max_slot = max(max_slot, slot + 1)
+            prev = by_slot.get(slot)
+            if prev is None or midi_val > prev:
+                by_slot[slot] = midi_val
+        return sorted(by_slot.items()), max_slot
+
     def collect_verticals(source: stream.Stream) -> dict[int, set[int]]:
         by_slot: dict[int, set[int]] = {}
         for item in source.flatten().notes:
@@ -1644,7 +1678,8 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     # is more accurate than a brute-force pitch max (which can mix in alto notes
     # when the soprano holds while the alto moves).
     if parts and difficulty != TabDifficulty.EASY:
-        top_staff_events, top_staff_max_slot = collect_highest_per_slot(parts[0])
+        top_staff_reference = melody_source if has_lyric_part else parts[0]
+        top_staff_events, top_staff_max_slot = collect_highest_per_slot(top_staff_reference)
         voice_coverage = len(melody_events) / max(1, len(top_staff_events))
         if voice_coverage < 0.75 and top_staff_events:
             melody_events = top_staff_events
@@ -1674,6 +1709,13 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             p1, p1_max = collect_part_events(melody_source, mode="high", voice_filter=None)
             melody_events = merge_melody(melody_events, p1)
             melody_max_slot = max(melody_max_slot, p1_max)
+
+        # If lyrics are present, treat lyric-bearing noteheads as high-confidence
+        # melody anchors so syllabic melody notes are not lost in polyphonic OMR.
+        lyric_melody, lyric_melody_max = collect_lyric_melody(melody_source)
+        if lyric_melody:
+            melody_events = merge_melody(melody_events, lyric_melody)
+            melody_max_slot = max(melody_max_slot, lyric_melody_max)
 
         if has_lyric_part:
             # A vocal part was identified by lyrics — trust it exclusively.
@@ -2126,12 +2168,12 @@ def arrange_tab(
     lines = {idx: ["-"] * (display_total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
     last_melody_pos: Optional[tuple[int, int]] = None
-    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 17
-    bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 10)
-    inner_max_fret = 9 if difficulty == TabDifficulty.EASY else 14
-    max_span = 3 if difficulty == TabDifficulty.EASY else (7 if difficulty == TabDifficulty.COMPLETE else MAX_FRETTED_SPAN)
-    chord_hit_span = max_span if difficulty == TabDifficulty.EASY else max(max_span, 6)
-    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else 12
+    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else (17 if difficulty == TabDifficulty.COMPLETE else 14)
+    bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (11 if difficulty == TabDifficulty.COMPLETE else 8)
+    inner_max_fret = 9 if difficulty == TabDifficulty.EASY else (14 if difficulty == TabDifficulty.COMPLETE else 10)
+    max_span = 3 if difficulty == TabDifficulty.EASY else MAX_FRETTED_SPAN
+    chord_hit_span = max_span
+    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 8)
 
     def normalize_midi_to_guitar_range(midi_value: int) -> int:
         moved = int(midi_value)
@@ -2252,7 +2294,7 @@ def arrange_tab(
         for slot, midi_value in display_inner_events:
             if slot >= display_total_slots:
                 continue
-            try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret, span_limit=MAX_FRETTED_SPAN)
+            try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret, span_limit=max_span)
 
     if difficulty == TabDifficulty.COMPLETE and style in (TabStyle.CHORDS, TabStyle.CHORDS_AND_MELODY, TabStyle.FINGERSTYLE):
         # Try filling implied chord tones at chord-change beats to make fuller voicings.
