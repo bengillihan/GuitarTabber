@@ -410,6 +410,20 @@ BASE_PAGE = """
       margin-top: 0.3rem;
       padding-left: 1.4rem;
     }
+    .ft {
+      cursor: pointer;
+      border-radius: 2px;
+    }
+    .ft:hover {
+      background: #fee2e2;
+      color: #b91c1c;
+      text-decoration: line-through;
+    }
+    .tab-edit-hint {
+      font-size: 0.78rem;
+      color: #9ca3af;
+      margin-top: 0.4rem;
+    }
     @media (max-width: 700px) {
       body {
         padding: 1rem;
@@ -523,6 +537,25 @@ BASE_PAGE = """
       window.addEventListener("resize", () => {
         if (!allRowsFit()) fitTabsToScreen();
       });
+
+      // --- Click-to-remove notes ---
+      // Clicking a fret number replaces it (and any digits sharing its slot)
+      // with dashes so the note disappears from the tab.  The action is
+      // reversible by reloading the page.
+      document.querySelectorAll(".tab-container").forEach((container) => {
+        container.addEventListener("click", (e) => {
+          const ft = e.target.closest(".ft");
+          if (!ft) return;
+          const len = parseInt(ft.dataset.len, 10) || ft.textContent.length;
+          const dashes = "-".repeat(len);
+          ft.textContent = dashes;
+          ft.classList.remove("ft");
+          ft.style.cursor = "";
+          ft.removeAttribute("data-nid");
+          ft.removeAttribute("data-len");
+          ft.removeAttribute("title");
+        });
+      });
     })();
   </script>
 </body>
@@ -583,6 +616,7 @@ HOME_BODY = """
       <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
       <button type="button" class="tab-fit-btn">Fit To Screen</button>
     </div>
+    <p class="tab-edit-hint">Click any fret number to remove that note.</p>
     {{ result.tab_html|safe }}
   </section>
 {% endif %}
@@ -674,6 +708,7 @@ ARRANGEMENT_BODY = """
     <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
     <button type="button" class="tab-fit-btn">Fit To Screen</button>
   </div>
+  <p class="tab-edit-hint">Click any fret number to remove that note.</p>
   {{ row.tab_html|safe }}
 {% else %}
   <pre>{{ row.tab_text }}</pre>
@@ -1827,8 +1862,17 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             if all_treble_slots:
                 melody_max_slot = max(melody_max_slot, max(all_treble_slots) + 1)
 
-    # Clamp melody to typical vocal/treble range to filter out deep bass bleed-through.
-    melody_events = [(s, m) for s, m in melody_events if 55 <= m <= 84]
+    # Normalize melody MIDI values into the playable guitar range (GUITAR_MIN_MIDI–GUITAR_MAX_MIDI)
+    # by octave-shifting rather than discarding notes entirely.
+    def _to_guitar_range(midi: int) -> int:
+        v = midi
+        while v > GUITAR_MAX_MIDI:
+            v -= 12
+        while v < GUITAR_MIN_MIDI:
+            v += 12
+        return v
+
+    melody_events = [(s, _to_guitar_range(m)) for s, m in melody_events]
 
     total_slots = max(melody_max_slot, bass_max_slot)
 
@@ -2182,13 +2226,42 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     )
 
 
-def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_note: str = "", lyric_chunk: str = "") -> str:
+def _annotate_frets_html(line_text: str, string_idx: int, row_idx: int, char_offset: int = 0) -> str:
+    """Wrap each run of digits in line_text with a clickable span.
+
+    Spans get a stable data-nid attribute (row/string/char-position) so JS can
+    identify and remove individual notes without affecting the rest of the layout.
+    """
+    parts: list[str] = []
+    i = 0
+    while i < len(line_text):
+        ch = line_text[i]
+        if ch.isdigit():
+            j = i
+            while j < len(line_text) and line_text[j].isdigit():
+                j += 1
+            fret_str = line_text[i:j]
+            nid = f"r{row_idx}s{string_idx}p{char_offset + i}"
+            parts.append(
+                f'<span class="ft" data-nid="{nid}" data-len="{len(fret_str)}" title="click to remove">'
+                f"{html.escape(fret_str)}</span>"
+            )
+            i = j
+        else:
+            parts.append(html.escape(ch))
+            i += 1
+    return "".join(parts)
+
+
+def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_note: str = "", lyric_chunk: str = "", row_idx: int = 0) -> str:
     row_note_markup = f'<div class="tab-notes">{html.escape(row_note)}</div>' if row_note else ""
     chord_markup = html.escape(chord_chunk) if chord_chunk else ""
     line_markup: list[str] = []
-    for string_name, line_text in row_lines:
+    for str_pos, (string_name, line_text) in enumerate(row_lines):
+        # string_name is "E","A","D","G","B","e" — string_pos maps to MIDI string index (5=high e … 0=low E)
+        annotated = _annotate_frets_html(line_text, str_pos, row_idx)
         line_markup.append(
-            f'<div class="sl"><span class="sn">{html.escape(string_name)}|</span>{html.escape(line_text)}</div>'
+            f'<div class="sl"><span class="sn">{html.escape(string_name)}|</span>{annotated}</div>'
         )
     lyric_markup = f'<div class="tab-lyrics">{html.escape(lyric_chunk)}</div>' if lyric_chunk.strip() else ""
     return (
@@ -2251,11 +2324,9 @@ def arrange_tab(
     lines = {idx: ["-"] * (display_total_slots * SLOT_WIDTH) for idx in range(6)}
     slot_fretted_notes: dict[int, list[int]] = {}
     last_melody_pos: Optional[tuple[int, int]] = None
-    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else (17 if difficulty == TabDifficulty.COMPLETE else 14)
+    melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 22
     bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (11 if difficulty == TabDifficulty.COMPLETE else 8)
     inner_max_fret = 9 if difficulty == TabDifficulty.EASY else (14 if difficulty == TabDifficulty.COMPLETE else 10)
-    # Keep simultaneous shapes physically plausible; this is a hard limiter
-    # against impossible wide grabs in generated fingerstyle/chord-melody.
     max_span = 3 if difficulty == TabDifficulty.EASY else 4
     chord_hit_span = max_span
     chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else (10 if difficulty == TabDifficulty.COMPLETE else 8)
@@ -2316,14 +2387,26 @@ def arrange_tab(
         for slot, midi_value in display_melody_events:
             if slot >= display_total_slots:
                 continue
+            # Try treble strings first; fall back to all 6 strings so no note is silently dropped.
             placed_pos = try_place_midi_at_slot(
                 slot,
                 midi_value,
-                preferred_strings=[5, 4, 3, 2, 1],
+                preferred_strings=[5, 4, 3, 2, 1, 0],
                 max_fret=melody_max_fret,
                 prefer_open=False,
                 near_position=last_melody_pos,
             )
+            if placed_pos is None:
+                # Retry ignoring span limits — a note that lands anywhere is
+                # better than a silent gap.
+                placed_pos = try_place_midi_at_slot(
+                    slot,
+                    midi_value,
+                    preferred_strings=[5, 4, 3, 2, 1, 0],
+                    max_fret=melody_max_fret,
+                    span_limit=99,
+                    prefer_open=False,
+                )
             if placed_pos is not None:
                 last_melody_pos = placed_pos
 
@@ -2455,7 +2538,7 @@ def arrange_tab(
     html_rows: list[str] = []
     plain_rows: list[str] = []
 
-    for start_slot, end_slot in row_ranges:
+    for row_idx, (start_slot, end_slot) in enumerate(row_ranges):
         # Build measure slices for this row and drop measures that contain no
         # frets/chords/labels so blank measures do not render as gaps.
         row_measure_starts_in_range = [slot for slot in row_measure_starts if start_slot <= slot < end_slot]
@@ -2525,7 +2608,7 @@ def arrange_tab(
         if lyric_chunk.strip():
             plain_block.append(lyric_chunk)
 
-        html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note, lyric_chunk=lyric_chunk))
+        html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note, lyric_chunk=lyric_chunk, row_idx=row_idx))
         plain_rows.append("\n".join(plain_block))
 
     tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
