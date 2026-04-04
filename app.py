@@ -370,6 +370,16 @@ BASE_PAGE = """
       display: inline-block;
       width: 1.4rem;
     }
+    .tab-lyrics {
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: var(--tab-font-size);
+      white-space: pre;
+      min-width: max-content;
+      color: #5a3e7a;
+      font-style: italic;
+      margin-top: 0.3rem;
+      padding-left: 1.4rem;
+    }
     @media (max-width: 700px) {
       body {
         padding: 1rem;
@@ -430,7 +440,7 @@ BASE_PAGE = """
       function contentFitsRow(row) {
         const available = row.clientWidth - 4;
         if (available <= 0) return true;
-        const blocks = row.querySelectorAll(".tab-notes, .tab-chords, .tab-strings");
+        const blocks = row.querySelectorAll(".tab-notes, .tab-chords, .tab-strings, .tab-lyrics");
         if (!blocks.length) return true;
         for (const block of blocks) {
           if (block.scrollWidth > available) {
@@ -699,6 +709,7 @@ class ScoreEvents:
     measure_slots: list[int]
     chord_events: list[tuple[int, str]]
     section_events: list[tuple[int, str]]
+    lyric_events: list[tuple[int, str]]
     total_slots: int
     was_truncated: bool
 
@@ -1330,6 +1341,18 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
     return "".join(line).rstrip()
 
 
+def build_lyric_line(total_slots: int, lyric_events: list[tuple[int, str]]) -> str:
+    """Build a character-grid lyric line aligned to slot positions."""
+    line = [" "] * (total_slots * SLOT_WIDTH)
+    for slot, text in lyric_events:
+        start = slot * SLOT_WIDTH
+        for idx, ch in enumerate(text):
+            pos = start + idx
+            if pos < len(line):
+                line[pos] = ch
+    return "".join(line).rstrip()
+
+
 def simplify_chord_label(label: str) -> str:
     cleaned = re.sub(r"\([^)]*\)", "", label or "").strip()
     lowered = cleaned.lower()
@@ -1489,7 +1512,9 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         lyric_part = next((p for p in parts if _part_has_lyrics(p)), None)
         melody_source = lyric_part if lyric_part is not None else parts[0]
     else:
+        lyric_part = None
         melody_source = full_flat
+    has_lyric_part = lyric_part is not None
     bass_source = parts[-1] if parts else full_flat
 
     def choose_voice(source: stream.Stream, preferred_voice: str) -> Optional[str]:
@@ -1591,6 +1616,28 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
     comp_source: Optional[stream.Stream] = parts[1] if len(parts) >= 3 else None
 
+    # Extract lyrics from the melody source so they can be displayed below the tab.
+    lyric_events: list[tuple[int, str]] = []
+    for _n in melody_source.flatten().notes:
+        if not isinstance(_n, note.Note):
+            continue
+        _slot = quarter_to_slot(float(_n.offset))
+        if _slot >= MAX_SLOTS:
+            continue
+        _text: Optional[str] = None
+        for _lyr in (getattr(_n, "lyrics", None) or []):
+            _t = getattr(_lyr, "text", None)
+            if _t:
+                _text = _t.strip()
+                break
+        if not _text:
+            _t2 = getattr(_n, "lyric", None)
+            if _t2:
+                _text = str(_t2).strip()
+        if _text:
+            lyric_events.append((_slot, _text))
+    lyric_events.sort(key=lambda x: x[0])
+
     # In Standard/Complete, use "highest note per slot" from top staff as a
     # fallback when voice-ID filtering is sparse — but prefer the voice-filtered
     # soprano events when they cover ≥ 75% of the top-staff slots, since voice 1
@@ -1600,24 +1647,14 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         top_staff_events, top_staff_max_slot = collect_highest_per_slot(parts[0])
         voice_coverage = len(melody_events) / max(1, len(top_staff_events))
         if voice_coverage < 0.75 and top_staff_events:
-            # Voice filtering produced too few notes — fall back to highest per slot.
             melody_events = top_staff_events
             melody_max_slot = max(melody_max_slot, top_staff_max_slot)
         elif top_staff_events:
-            # Keep voice-filtered events but extend the range to the full top-staff span.
             melody_max_slot = max(melody_max_slot, top_staff_max_slot)
-        # Bass voice IDs from OMR are often unreliable; keep lowest note per slot.
         low_staff_events, low_staff_max_slot = collect_lowest_per_slot(bass_source)
         if low_staff_events and len(low_staff_events) >= max(3, len(bass_events) // 2):
             bass_events = low_staff_events
             bass_max_slot = max(bass_max_slot, low_staff_max_slot)
-
-    # --- Iterative multi-pass melody improvement ---
-    # Each pass targets a different extraction strategy. Rather than replacing
-    # earlier results wholesale, we MERGE: keeping already-found notes and
-    # filling in slots that are still empty.  This mirrors the "multiple passes
-    # looking for different things" idea — each pass contributes what it finds
-    # best and doesn't clobber work done by a more accurate earlier pass.
 
     def merge_melody(base: list[tuple[int, int]], additions: list[tuple[int, int]]) -> list[tuple[int, int]]:
         """Return base with any slots from additions that base doesn't already cover."""
@@ -1632,29 +1669,41 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         )
         sparse_threshold = max(4, int(all_noteheads * 0.05))
 
-        # Pass 1: unfiltered melody source (keeps lyric-part notes, no voice filter).
+        # Pass 1: unfiltered melody source (no voice filter).
         if len(melody_events) < sparse_threshold:
             p1, p1_max = collect_part_events(melody_source, mode="high", voice_filter=None)
             melody_events = merge_melody(melody_events, p1)
             melody_max_slot = max(melody_max_slot, p1_max)
 
-        # Pass 2: highest-per-slot from every part; fill in any still-missing slots.
-        for part in parts:
-            candidate, candidate_max = collect_highest_per_slot(part)
-            melody_events = merge_melody(melody_events, candidate)
-            melody_max_slot = max(melody_max_slot, candidate_max)
-            if len(melody_events) >= sparse_threshold * 4:
-                break  # enough notes; stop adding inner-voice noise
+        if has_lyric_part:
+            # A vocal part was identified by lyrics — trust it exclusively.
+            # Merging from other parts pulls in piano accompaniment patterns
+            # and replaces the real melody with chord/bass filler.
+            pass
+        else:
+            # No vocal part found — run the full multi-pass to extract melody
+            # from whatever the OMR produced.
 
-        # Pass 3: global highest across all treble parts — catches anything still missing.
-        all_treble_slots: dict[int, int] = {}
-        for part in parts[:-1]:
-            for s, midi_val in collect_highest_per_slot(part)[0]:
-                if s not in all_treble_slots or midi_val > all_treble_slots[s]:
-                    all_treble_slots[s] = midi_val
-        melody_events = merge_melody(melody_events, list(all_treble_slots.items()))
-        if all_treble_slots:
-            melody_max_slot = max(melody_max_slot, max(all_treble_slots) + 1)
+            # Pass 2: highest-per-slot from every part; fill in any still-missing slots.
+            for part in parts:
+                candidate, candidate_max = collect_highest_per_slot(part)
+                melody_events = merge_melody(melody_events, candidate)
+                melody_max_slot = max(melody_max_slot, candidate_max)
+                if len(melody_events) >= sparse_threshold * 4:
+                    break
+
+            # Pass 3: global highest across all treble parts.
+            all_treble_slots: dict[int, int] = {}
+            for part in parts[:-1]:
+                for s, midi_val in collect_highest_per_slot(part)[0]:
+                    if s not in all_treble_slots or midi_val > all_treble_slots[s]:
+                        all_treble_slots[s] = midi_val
+            melody_events = merge_melody(melody_events, list(all_treble_slots.items()))
+            if all_treble_slots:
+                melody_max_slot = max(melody_max_slot, max(all_treble_slots) + 1)
+
+    # Clamp melody to typical vocal/treble range to filter out deep bass bleed-through.
+    melody_events = [(s, m) for s, m in melody_events if 55 <= m <= 84]
 
     total_slots = max(melody_max_slot, bass_max_slot)
 
@@ -2002,12 +2051,13 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         measure_slots=measure_slots,
         chord_events=chord_events,
         section_events=section_events,
+        lyric_events=lyric_events,
         total_slots=total_slots,
         was_truncated=was_truncated,
     )
 
 
-def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_note: str = "") -> str:
+def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_note: str = "", lyric_chunk: str = "") -> str:
     row_note_markup = f'<div class="tab-notes">{html.escape(row_note)}</div>' if row_note else ""
     chord_markup = html.escape(chord_chunk) if chord_chunk else ""
     line_markup: list[str] = []
@@ -2015,11 +2065,13 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_
         line_markup.append(
             f'<div class="sl"><span class="sn">{html.escape(string_name)}|</span>{html.escape(line_text)}</div>'
         )
+    lyric_markup = f'<div class="tab-lyrics">{html.escape(lyric_chunk)}</div>' if lyric_chunk.strip() else ""
     return (
         '<div class="tab-row">'
         f"{row_note_markup}"
         f'<div class="tab-chords">{chord_markup}</div>'
         f'<div class="tab-strings">{"".join(line_markup)}</div>'
+        f"{lyric_markup}"
         "</div>"
     )
 
@@ -2068,6 +2120,7 @@ def arrange_tab(
     display_played_chord_events = [(remap_slot(slot), midi_values) for slot, midi_values in events.played_chord_events]
     display_chord_events = [(remap_slot(slot), label) for slot, label in events.chord_events]
     display_section_events = [(remap_slot(slot), label) for slot, label in events.section_events]
+    display_lyric_events = [(remap_slot(slot), text) for slot, text in events.lyric_events]
     display_measure_slots = sorted({remap_slot(slot) for slot in measure_starts})
 
     lines = {idx: ["-"] * (display_total_slots * SLOT_WIDTH) for idx in range(6)}
@@ -2217,6 +2270,7 @@ def arrange_tab(
     place_measure_dividers(lines, display_measure_slots)
 
     chord_line = build_chord_line(display_total_slots, display_chord_events)
+    lyric_line = build_lyric_line(display_total_slots, display_lyric_events)
     row_measure_starts = display_measure_slots[:]
     if not row_measure_starts or row_measure_starts[0] != 0:
         row_measure_starts = [0] + row_measure_starts
@@ -2290,16 +2344,19 @@ def arrange_tab(
             continue
 
         chord_parts: list[str] = []
+        lyric_parts: list[str] = []
         row_note_labels: list[str] = []
         for measure_start, measure_end in kept_measure_ranges:
             seg_char_start = measure_start * SLOT_WIDTH
             seg_char_end = measure_end * SLOT_WIDTH
             chord_parts.append(chord_line[seg_char_start:seg_char_end])
+            lyric_parts.append(lyric_line[seg_char_start:seg_char_end] if seg_char_end <= len(lyric_line) else "")
             row_note_labels.extend(
                 label for slot, label in display_section_events if measure_start <= slot < measure_end
             )
 
         chord_chunk = "".join(chord_parts).rstrip()
+        lyric_chunk = "".join(lyric_parts).rstrip()
         row_note = "  ".join(row_note_labels)
         plain_block: list[str] = []
         if row_note:
@@ -2318,7 +2375,10 @@ def arrange_tab(
             row_lines.append((STRING_NAMES[string_index], f"{chunk}|"))
             plain_block.append(f"{STRING_NAMES[string_index]}|{chunk}|")
 
-        html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note))
+        if lyric_chunk.strip():
+            plain_block.append(lyric_chunk)
+
+        html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note, lyric_chunk=lyric_chunk))
         plain_rows.append("\n".join(plain_block))
 
     tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
