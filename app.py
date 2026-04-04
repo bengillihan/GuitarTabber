@@ -4,6 +4,7 @@ import subprocess
 import html
 import tempfile
 import re
+import copy
 from bisect import bisect_right
 from dataclasses import dataclass
 from enum import Enum
@@ -283,6 +284,35 @@ BASE_PAGE = """
       align-items: center;
       gap: 0.65rem;
       margin: 0.75rem 0 0.4rem;
+    }
+    .note-editor {
+      margin-top: 1rem;
+      border: 1px solid #e2dcc6;
+      border-radius: 8px;
+      background: #faf8f1;
+      padding: 0.75rem;
+    }
+    .note-editor h3 {
+      margin: 0 0 0.6rem 0;
+      font-size: 1.05rem;
+    }
+    .note-editor-list {
+      max-height: 280px;
+      overflow: auto;
+      border: 1px solid #e2dcc6;
+      border-radius: 6px;
+      background: #fff;
+      padding: 0.5rem;
+      display: grid;
+      gap: 0.25rem;
+    }
+    .note-editor-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+      font-size: 0.86rem;
+      color: #2f2f2f;
     }
     .tab-controls label {
       color: #4f4936;
@@ -632,6 +662,12 @@ ARRANGEMENT_BODY = """
 {% if transpose_note %}
   <p class="meta">{{ transpose_note }}</p>
 {% endif %}
+{% if note_edit_error %}
+  <div class="error">{{ note_edit_error }}</div>
+{% endif %}
+{% if note_edit_note %}
+  <p class="meta">{{ note_edit_note }}</p>
+{% endif %}
 {% if row.tab_html %}
   <div class="tab-controls">
     <label>Tab text size: <span class="tab-size-value">15.0</span>px</label>
@@ -641,6 +677,27 @@ ARRANGEMENT_BODY = """
   {{ row.tab_html|safe }}
 {% else %}
   <pre>{{ row.tab_text }}</pre>
+{% endif %}
+{% if note_catalog %}
+  <section class="note-editor">
+    <h3>Transcribed Notes Editor</h3>
+    <p class="meta">Check notes to remove, then preview or save a new arrangement.</p>
+    <form method="post" class="transpose-form">
+      <input type="hidden" name="target_key" value="{{ selected_key }}">
+      <input type="hidden" name="target_style" value="{{ selected_style }}">
+      <input type="hidden" name="target_difficulty" value="{{ selected_difficulty }}">
+      <div class="note-editor-list">
+        {% for note in note_catalog %}
+          <label class="note-editor-item">
+            <input type="checkbox" name="remove_note_ids" value="{{ note.id }}" {% if note.id in selected_remove_ids %}checked{% endif %}>
+            <span>{{ note.label }}</span>
+          </label>
+        {% endfor %}
+      </div>
+      <button type="submit" name="note_edit_action" value="preview">Preview Without Selected Notes</button>
+      <button type="submit" name="note_edit_action" value="save">Save As New Arrangement</button>
+    </form>
+  </section>
 {% endif %}
 """
 
@@ -2626,6 +2683,127 @@ def parse_musicxml_bytes(file_bytes: bytes) -> stream.Score:
             raise ScoreParseError(f"Saved source file could not be parsed: {exc}") from exc
 
 
+def iter_transcribed_note_points(score: stream.Score):
+    parts = list(score.parts) or [score]
+    point_index = 0
+    for part_idx, part in enumerate(parts):
+        part_name = (part.partName or f"Part {part_idx + 1}").strip()
+        for element in part.recurse().notes:
+            try:
+                offset = float(element.getOffsetInHierarchy(score))
+            except Exception:
+                continue
+            slot = quarter_to_slot(offset)
+            measure_ctx = element.getContextByClass(stream.Measure)
+            measure_no = int(getattr(measure_ctx, "number", 0) or 0)
+            measure_offset = 0.0
+            if measure_ctx is not None:
+                try:
+                    measure_offset = float(measure_ctx.getOffsetInHierarchy(score))
+                except Exception:
+                    measure_offset = 0.0
+            beat_pos = max(0.0, offset - measure_offset)
+            beat_label = f"{(beat_pos + 1):.2f}".rstrip("0").rstrip(".")
+
+            if isinstance(element, note.Note):
+                point_id = f"n:{part_idx}:{slot}:{int(element.pitch.midi)}:{point_index}"
+                point_index += 1
+                yield {
+                    "id": point_id,
+                    "part_index": part_idx,
+                    "slot": slot,
+                    "measure": measure_no,
+                    "beat": beat_label,
+                    "part_name": part_name,
+                    "element": element,
+                    "pitch_name": element.pitch.nameWithOctave,
+                    "midi": int(element.pitch.midi),
+                    "chord_pitch_index": None,
+                }
+                continue
+
+            if isinstance(element, chord.Chord):
+                for pitch_idx, p in enumerate(element.pitches):
+                    point_id = f"c:{part_idx}:{slot}:{int(p.midi)}:{pitch_idx}:{point_index}"
+                    point_index += 1
+                    yield {
+                        "id": point_id,
+                        "part_index": part_idx,
+                        "slot": slot,
+                        "measure": measure_no,
+                        "beat": beat_label,
+                        "part_name": part_name,
+                        "element": element,
+                        "pitch_name": p.nameWithOctave,
+                        "midi": int(p.midi),
+                        "chord_pitch_index": pitch_idx,
+                    }
+
+
+def build_note_catalog(score: stream.Score) -> list[dict[str, str]]:
+    catalog: list[dict[str, str]] = []
+    for point in iter_transcribed_note_points(score):
+        label = (
+            f"M{point['measure']:>3}  B{point['beat']:<4}  "
+            f"{point['pitch_name']:<5} (midi {point['midi']})  {point['part_name']}"
+        )
+        catalog.append({"id": point["id"], "label": label})
+    return catalog
+
+
+def remove_notes_by_ids(score: stream.Score, remove_ids: set[str]) -> stream.Score:
+    if not remove_ids:
+        return score
+    working = copy.deepcopy(score)
+    note_elements: list[note.Note] = []
+    chord_pitches: dict[int, tuple[chord.Chord, set[int]]] = {}
+
+    for point in iter_transcribed_note_points(working):
+        if point["id"] not in remove_ids:
+            continue
+        element = point["element"]
+        chord_pitch_index = point["chord_pitch_index"]
+        if isinstance(element, note.Note):
+            note_elements.append(element)
+        elif isinstance(element, chord.Chord) and isinstance(chord_pitch_index, int):
+            key = id(element)
+            if key not in chord_pitches:
+                chord_pitches[key] = (element, set())
+            chord_pitches[key][1].add(chord_pitch_index)
+
+    for n in note_elements:
+        site = n.activeSite
+        if site is not None:
+            try:
+                site.remove(n, recurse=True)
+            except Exception:
+                try:
+                    site.remove(n)
+                except Exception:
+                    pass
+
+    for _, (ch, idxs) in chord_pitches.items():
+        for idx in sorted(idxs, reverse=True):
+            if idx < 0 or idx >= len(ch.pitches):
+                continue
+            try:
+                ch.remove(ch.pitches[idx])
+            except Exception:
+                pass
+        if len(ch.pitches) == 0:
+            site = ch.activeSite
+            if site is not None:
+                try:
+                    site.remove(ch, recurse=True)
+                except Exception:
+                    try:
+                        site.remove(ch)
+                    except Exception:
+                        pass
+
+    return working
+
+
 def transpose_score_between_keys(score: stream.Score, source_key_name: str, target_key_name: str) -> stream.Score:
     source = parse_key_name(source_key_name)
     target = parse_key_name(target_key_name)
@@ -2880,6 +3058,10 @@ def view_arrangement(arrangement_id: int):
     selected_style = parse_style(getattr(row, "style", None))
     transpose_error = None
     transpose_note = None
+    note_edit_error = None
+    note_edit_note = None
+    selected_remove_ids: set[str] = set()
+    note_catalog: list[dict[str, str]] = []
     created_label = row.created_at.strftime("%Y-%m-%d %H:%M") if row.created_at else ""
     display = {
         "id": row.id,
@@ -2898,25 +3080,46 @@ def view_arrangement(arrangement_id: int):
         "has_original": bool(row.has_original),
     }
 
+    def load_score_for_arrangement() -> stream.Score:
+        file_data = (
+            db.session.query(Song.file_data)
+            .join(Arrangement, Arrangement.song_id == Song.id)
+            .filter(Arrangement.id == arrangement_id)
+            .scalar()
+        )
+        if not file_data:
+            raise ScoreParseError("Stored source file not found for this arrangement.")
+        return parse_musicxml_bytes(file_data)
+
+    try:
+        base_score = load_score_for_arrangement()
+        note_catalog = build_note_catalog(base_score)
+    except Exception:
+        note_catalog = []
+
     if request.method == "POST":
         selected_key = (request.form.get("target_key") or "").strip()
         selected_difficulty = parse_difficulty(request.form.get("target_difficulty"))
         selected_style = parse_style(request.form.get("target_style"))
         transpose_action = (request.form.get("transpose_action") or "preview").strip().lower()
+        note_edit_action = (request.form.get("note_edit_action") or "").strip().lower()
+        selected_remove_ids = set(request.form.getlist("remove_note_ids"))
+
         if selected_key not in key_options:
-            transpose_error = "Please choose a valid target key."
+            if note_edit_action:
+                note_edit_error = "Please choose a valid target key."
+            else:
+                transpose_error = "Please choose a valid target key."
         else:
             try:
-                file_data = (
-                    db.session.query(Song.file_data)
-                    .join(Arrangement, Arrangement.song_id == Song.id)
-                    .filter(Arrangement.id == arrangement_id)
-                    .scalar()
-                )
-                if not file_data:
-                    raise ScoreParseError("Stored source file not found for this arrangement.")
-                score = parse_musicxml_bytes(file_data)
+                score = load_score_for_arrangement()
                 transposed = transpose_score_between_keys(score, row.key_name, selected_key)
+
+                # Rebuild editor catalog in the current key preview context.
+                note_catalog = build_note_catalog(transposed)
+                if selected_remove_ids:
+                    transposed = remove_notes_by_ids(transposed, selected_remove_ids)
+
                 source_label = f"{row.original_filename} (transposed to {selected_key})"
                 rendered = render_score_to_tab_payload(
                     transposed,
@@ -2934,7 +3137,9 @@ def view_arrangement(arrangement_id: int):
                 display["style"] = rendered["style"]
                 display["style_label"] = style_label(selected_style)
                 display["capo_suggestion"] = rendered["capo_suggestion"]
-                if transpose_action == "save":
+
+                save_requested = (transpose_action == "save") or (note_edit_action == "save")
+                if save_requested:
                     new_arrangement = Arrangement(
                         song_id=row.song_id,
                         key_name=rendered["key_name"],
@@ -2947,15 +3152,28 @@ def view_arrangement(arrangement_id: int):
                     db.session.add(new_arrangement)
                     db.session.commit()
                     return redirect(url_for("view_arrangement", arrangement_id=new_arrangement.id))
-                transpose_note = (
-                    f"Showing preview: {style_label(selected_style)}, {selected_key}, {difficulty_label(selected_difficulty)}. "
-                    "Saved arrangement remains unchanged."
-                )
-                if rendered["truncation_warning"]:
-                    transpose_note = f"{transpose_note} {rendered['truncation_warning']}"
+
+                if note_edit_action:
+                    note_edit_note = (
+                        f"Previewing edited notes: removed {len(selected_remove_ids)} note(s), "
+                        f"{style_label(selected_style)}, {selected_key}, {difficulty_label(selected_difficulty)}. "
+                        "Saved arrangement remains unchanged."
+                    )
+                    if rendered["truncation_warning"]:
+                        note_edit_note = f"{note_edit_note} {rendered['truncation_warning']}"
+                else:
+                    transpose_note = (
+                        f"Showing preview: {style_label(selected_style)}, {selected_key}, {difficulty_label(selected_difficulty)}. "
+                        "Saved arrangement remains unchanged."
+                    )
+                    if rendered["truncation_warning"]:
+                        transpose_note = f"{transpose_note} {rendered['truncation_warning']}"
             except Exception as exc:
                 db.session.rollback()
-                transpose_error = f"Could not update this arrangement: {exc}"
+                if note_edit_action:
+                    note_edit_error = f"Could not update note edits: {exc}"
+                else:
+                    transpose_error = f"Could not update this arrangement: {exc}"
 
     return render_page(
         ARRANGEMENT_BODY,
@@ -2969,6 +3187,10 @@ def view_arrangement(arrangement_id: int):
         selected_difficulty=selected_difficulty.value,
         transpose_error=transpose_error,
         transpose_note=transpose_note,
+        note_edit_error=note_edit_error,
+        note_edit_note=note_edit_note,
+        note_catalog=note_catalog,
+        selected_remove_ids=selected_remove_ids,
     )
 
 
