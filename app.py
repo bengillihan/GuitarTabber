@@ -3060,6 +3060,73 @@ def parse_musicxml_bytes(file_bytes: bytes) -> stream.Score:
             raise ScoreParseError(f"Saved source file could not be parsed: {exc}") from exc
 
 
+def _clone_part_template(source_part: stream.Stream, fallback_id: str) -> stream.Part:
+    part_id = str(getattr(source_part, "id", "") or fallback_id)
+    part_name = str(getattr(source_part, "partName", "") or part_id)
+    new_part = stream.Part(id=part_id)
+    new_part.partName = part_name
+    return new_part
+
+
+def combine_scores_sequential(scores: list[stream.Score]) -> stream.Score:
+    """Concatenate multiple page scores end-to-end (page 1 then page 2...)."""
+    if not scores:
+        raise ScoreParseError("No scores available to combine.")
+    if len(scores) == 1:
+        return scores[0]
+
+    normalized_parts: list[list[stream.Stream]] = []
+    max_parts = 0
+    for score in scores:
+        parts = list(score.parts) if list(score.parts) else [score]
+        normalized_parts.append(parts)
+        max_parts = max(max_parts, len(parts))
+
+    combined = stream.Score()
+    if getattr(scores[0], "metadata", None) is not None:
+        combined.metadata = copy.deepcopy(scores[0].metadata)
+
+    target_parts: list[stream.Part] = []
+    for idx in range(max_parts):
+        template_source = normalized_parts[0][idx] if idx < len(normalized_parts[0]) else normalized_parts[0][0]
+        target_parts.append(_clone_part_template(template_source, f"Part{idx+1}"))
+
+    for page_parts in normalized_parts:
+        for part_idx in range(max_parts):
+            if part_idx >= len(page_parts):
+                continue
+            source_part = page_parts[part_idx]
+            target_part = target_parts[part_idx]
+            source_measures = list(source_part.getElementsByClass(stream.Measure))
+            if source_measures:
+                for measure_obj in source_measures:
+                    target_part.append(copy.deepcopy(measure_obj))
+            else:
+                page_offset = float(target_part.highestTime)
+                for el in source_part.flatten().notesAndRests:
+                    target_part.insert(page_offset + float(el.offset), copy.deepcopy(el))
+
+    for p in target_parts:
+        combined.insert(0, p)
+    return combined
+
+
+def score_to_musicxml_bytes(score: stream.Score) -> tuple[bytes, str]:
+    """Serialize score to MusicXML bytes, returning (bytes, mime_type)."""
+    temp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".musicxml", delete=False) as temp_file:
+            temp_path = temp_file.name
+        score.write("musicxml", fp=temp_path)
+        return Path(temp_path).read_bytes(), "application/vnd.recordare.musicxml+xml"
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+
 def iter_transcribed_note_points(score: stream.Score):
     parts = list(score.parts) or [score]
     point_index = 0
@@ -3229,15 +3296,26 @@ def parse_sheet_to_tab(
         if len(parse_paths) == 1:
             source_label = f"{safe_name} (via OMR: {parse_paths[0].name})"
         else:
-            source_label = f"{safe_name} (via OMR: {len(parse_paths)} exported files, using first)"
-            multi_page_warning = (
-                f"Detected {len(parse_paths)} OMR-exported files. Currently using the first export only."
-            )
+            source_label = f"{safe_name} (via OMR: {len(parse_paths)} exported files)"
+            multi_page_warning = f"Detected {len(parse_paths)} OMR-exported files. Combining pages sequentially."
+
+    parsed_scores: list[stream.Score] = []
+    parse_errors: list[str] = []
+    for p in parse_paths:
+        try:
+            parsed_scores.append(converter.parse(str(p)))
+        except Exception as exc:
+            parse_errors.append(f"{p.name}: {exc}")
+
+    if not parsed_scores:
+        raise ScoreParseError(
+            "MusicXML parsing failed for all OMR exports: " + "; ".join(parse_errors[:5])
+        )
 
     try:
-        score = converter.parse(str(parse_paths[0]))
+        score = combine_scores_sequential(parsed_scores)
     except Exception as exc:
-        raise ScoreParseError(f"MusicXML parsing failed: {exc}") from exc
+        raise ScoreParseError(f"Could not combine multi-page MusicXML exports: {exc}") from exc
 
     title = safe_name
     if score.metadata and score.metadata.title:
@@ -3245,16 +3323,20 @@ def parse_sheet_to_tab(
 
     rendered = render_score_to_tab_payload(score, title, source_label, difficulty=difficulty, style=style)
 
-    ext = parse_paths[0].suffix.lower()
-    output_mime_type = "application/vnd.recordare.musicxml+xml"
-    if ext == ".mxl":
-        output_mime_type = "application/vnd.recordare.musicxml"
+    musicxml_bytes, output_mime_type = score_to_musicxml_bytes(score)
+
+    if parse_errors:
+        extra = (
+            f" Parsed {len(parsed_scores)} of {len(parse_paths)} exported files; "
+            f"some pages could not be read ({'; '.join(parse_errors[:3])})."
+        )
+        multi_page_warning = f"{multi_page_warning} {extra}".strip()
 
     return {
         "song_title": title,
         "key_name": rendered["key_name"],
         "capo_suggestion": rendered["capo_suggestion"],
-        "musicxml_bytes": parse_paths[0].read_bytes(),
+        "musicxml_bytes": musicxml_bytes,
         "musicxml_mime_type": output_mime_type,
         "truncation_warning": rendered["truncation_warning"],
         "multi_page_warning": multi_page_warning,
