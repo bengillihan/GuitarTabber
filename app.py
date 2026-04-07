@@ -1566,27 +1566,16 @@ def score_placement(
     lines: dict[int, list[str]],
     display_melody_events: list[tuple[int, int]],
     display_total_slots: int,
+    style: TabStyle = TabStyle.FINGERSTYLE,
+    display_bass_events: Optional[list[tuple[int, int]]] = None,
+    display_chord_events: Optional[list[tuple[int, str]]] = None,
 ) -> tuple[int, int]:
     """Return (accuracy_score, playability_score) each 0–100.
 
-    accuracy   — what fraction of melody slots have any fret placed on them.
+    accuracy   — style-aware coverage score.
     playability — penalises fret-span violations and large position jumps.
     """
-    # --- Accuracy ---
-    melody_slots_in_range = [s for s, _ in display_melody_events if s < display_total_slots]
-    placed_count = 0
-    for slot in melody_slots_in_range:
-        char_start = slot * SLOT_WIDTH
-        char_end = char_start + SLOT_WIDTH
-        for string_idx in range(6):
-            seg = lines[string_idx][char_start:char_end]
-            if any(c.isdigit() for c in seg):
-                placed_count += 1
-                break
-    accuracy = int(100 * placed_count / max(1, len(melody_slots_in_range)))
-
-    # --- Playability ---
-    # Build slot → list[fret] from all strings.
+    # Build slot → list[fret] from all strings (shared by accuracy + playability).
     slot_frets: dict[int, list[int]] = {}
     melody_fret_sequence: list[int] = []
     for string_idx in range(6):
@@ -1603,6 +1592,43 @@ def score_placement(
                 i = j
             else:
                 i += 1
+
+    def slot_has_any(slot: int) -> bool:
+        return len(slot_frets.get(slot, [])) > 0
+
+    def slot_has_poly(slot: int, min_notes: int = 2) -> bool:
+        return len(slot_frets.get(slot, [])) >= min_notes
+
+    # --- Accuracy (style-aware) ---
+    melody_slots_in_range = sorted({s for s, _ in display_melody_events if 0 <= s < display_total_slots})
+    bass_slots_in_range = sorted({s for s, _ in (display_bass_events or []) if 0 <= s < display_total_slots})
+    chord_slots_in_range = sorted({s for s, _ in (display_chord_events or []) if 0 <= s < display_total_slots})
+
+    melody_hits = sum(1 for s in melody_slots_in_range if slot_has_any(s))
+    bass_hits = sum(1 for s in bass_slots_in_range if slot_has_any(s))
+    # Count a chord slot as covered when at least one chord-tone lands.
+    # This avoids unfairly penalizing intentionally sparse/partial voicings.
+    chord_hits = sum(1 for s in chord_slots_in_range if slot_has_any(s))
+
+    melody_ratio = melody_hits / max(1, len(melody_slots_in_range))
+    bass_ratio = bass_hits / max(1, len(bass_slots_in_range))
+    chord_ratio = chord_hits / max(1, len(chord_slots_in_range))
+
+    if style == TabStyle.MELODY:
+        accuracy = int(100 * melody_ratio)
+    elif style == TabStyle.CHORDS:
+        accuracy = int(100 * chord_ratio)
+    elif style == TabStyle.FINGERSTYLE:
+        accuracy = int(100 * (0.75 * melody_ratio + 0.25 * bass_ratio))
+    else:
+        # Chords + melody fills: chords should land at changes, with melody on non-chord-change slots.
+        chord_slot_set = set(chord_slots_in_range)
+        fill_slots = [s for s in melody_slots_in_range if s not in chord_slot_set]
+        fill_hits = sum(1 for s in fill_slots if slot_has_any(s))
+        fill_ratio = fill_hits / max(1, len(fill_slots))
+        accuracy = int(100 * (0.65 * chord_ratio + 0.35 * fill_ratio))
+
+    # --- Playability ---
     # Collect melody fret sequence (highest string with a digit per melody slot).
     for slot in sorted(melody_slots_in_range):
         char_start = slot * SLOT_WIDTH
@@ -1646,7 +1672,7 @@ def score_placement(
         raw = max(0.0, 1.0 - penalty / total_weight)
         playability = int(raw * 100)
 
-    return accuracy, playability
+    return max(0, min(100, accuracy)), max(0, min(100, playability))
 
 
 def simplify_chord_label(label: str) -> str:
@@ -2904,7 +2930,14 @@ def arrange_tab(
 
     tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
     tab_plain = "\n\n".join(plain_rows)
-    accuracy, playability = score_placement(lines, display_melody_events, display_total_slots)
+    accuracy, playability = score_placement(
+        lines,
+        display_melody_events,
+        display_total_slots,
+        style=style,
+        display_bass_events=display_bass_events,
+        display_chord_events=display_chord_events,
+    )
     return tab_html, tab_plain, events.was_truncated, accuracy, playability
 
 
