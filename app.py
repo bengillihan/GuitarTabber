@@ -435,6 +435,45 @@ BASE_PAGE = """
     .score-ok   { background: #fef9c3; color: #713f12; }
     .score-low  { background: #fee2e2; color: #991b1b; }
     .score-hint { font-size: 0.78rem; color: #9ca3af; }
+    .reprocess-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      margin: 0.75rem 0 0.25rem;
+      padding: 0.6rem 0.75rem;
+      background: #f5f3ec;
+      border: 1px solid #e2dcc6;
+      border-radius: 6px;
+    }
+    .reprocess-label {
+      font-size: 0.88rem;
+      color: #5f5a47;
+      white-space: nowrap;
+    }
+    .reprocess-form {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      align-items: center;
+    }
+    .reprocess-form select {
+      font-size: 0.88rem;
+      padding: 0.25rem 0.4rem;
+      border-radius: 4px;
+      border: 1px solid #c8c3b0;
+      background: #fff;
+    }
+    .reprocess-form button {
+      font-size: 0.88rem;
+      padding: 0.25rem 0.75rem;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      background: #4a7c59;
+      color: #fff;
+    }
+    .reprocess-form button:hover { background: #3a6347; }
     @media (max-width: 700px) {
       body {
         padding: 1rem;
@@ -633,6 +672,24 @@ HOME_BODY = """
   <span class="score-badge {% if result.playability_score >= 80 %}score-good{% elif result.playability_score >= 50 %}score-ok{% else %}score-low{% endif %}">{{ result.playability_score }}%</span>
 </p>
 {% endif %}
+<div class="reprocess-bar">
+  <span class="reprocess-label">Try a different style or complexity with the same file:</span>
+  <form method="post" action="{{ result.arrangement_url }}" class="reprocess-form">
+    <select name="target_style">
+      {% for option in style_options %}
+        <option value="{{ option.value }}" title="{{ option.description }}" {% if option.value == result.selected_style %}selected{% endif %}>{{ option.label }}</option>
+      {% endfor %}
+    </select>
+    <select name="target_difficulty">
+      {% for option in difficulty_options %}
+        <option value="{{ option.value }}" {% if option.value == result.selected_difficulty %}selected{% endif %}>{{ option.label }}</option>
+      {% endfor %}
+    </select>
+    <input type="hidden" name="target_key" value="{{ result.key_name }}">
+    <button type="submit" name="source_action" value="reprocess_preview">Preview</button>
+    <button type="submit" name="source_action" value="reprocess_save">Save New</button>
+  </form>
+</div>
     <div class="tab-controls">
       <label>Tab text size: <span class="tab-size-value">15.0</span>px</label>
       <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
@@ -3310,11 +3367,14 @@ def index():
                     "truncation_warning": parsed["truncation_warning"],
                     "multi_page_warning": parsed["multi_page_warning"],
                     "tab_html": parsed["tab_html"],
+                    "arrangement_id": arrangement.id,
                     "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
                     "download_url": url_for("download_arrangement", arrangement_id=arrangement.id),
                     "download_original_url": url_for("download_original", arrangement_id=arrangement.id),
                     "accuracy_score": parsed.get("accuracy_score"),
                     "playability_score": parsed.get("playability_score"),
+                    "selected_style": selected_style.value,
+                    "selected_difficulty": selected_difficulty.value,
                 }
             except OMRConversionError as exc:
                 db.session.rollback()
