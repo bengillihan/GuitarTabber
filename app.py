@@ -58,10 +58,10 @@ class TabDifficulty(str, Enum):
 
 
 class TabStyle(str, Enum):
-    MELODY = "melody"
-    CHORDS = "chords"
-    FINGERSTYLE = "fingerstyle"
-    CHORDS_AND_MELODY = "chords_and_melody"
+    MELODY = "melody"           # Solo: single-note melody only, exact pitch/rhythm
+    CHORDS = "chords"           # Accompaniment: full chord shapes, no melody
+    FINGERSTYLE = "fingerstyle" # Melody + Bass: melody always top, bass on strong beats
+    CHORDS_AND_MELODY = "chords_and_melody"  # Strum + Licks: chords at changes, melody fills between
 
 
 # Standard open-position guitar chord shapes.
@@ -592,7 +592,7 @@ HOME_BODY = """
   <label for="style"><strong>Style:</strong></label>
   <select id="style" name="style">
     {% for option in style_options %}
-      <option value="{{ option.value }}" {% if option.value == selected_style %}selected{% endif %}>{{ option.label }}</option>
+      <option value="{{ option.value }}" title="{{ option.description }}" {% if option.value == selected_style %}selected{% endif %}>{{ option.label }}</option>
     {% endfor %}
   </select>
   <label for="difficulty"><strong>Complexity:</strong></label>
@@ -708,7 +708,7 @@ ARRANGEMENT_BODY = """
   <label for="target_style"><strong>Style:</strong></label>
   <select id="target_style" name="target_style">
     {% for option in style_options %}
-      <option value="{{ option.value }}" {% if option.value == selected_style %}selected{% endif %}>{{ option.label }}</option>
+      <option value="{{ option.value }}" title="{{ option.description }}" {% if option.value == selected_style %}selected{% endif %}>{{ option.label }}</option>
     {% endfor %}
   </select>
   <label for="target_difficulty"><strong>Complexity:</strong></label>
@@ -927,15 +927,26 @@ def parse_style(value: Optional[str]) -> TabStyle:
 
 def style_label(style: TabStyle) -> str:
     return {
-        TabStyle.MELODY: "Melody Only",
-        TabStyle.CHORDS: "Chords Only",
-        TabStyle.FINGERSTYLE: "Fingerstyle",
-        TabStyle.CHORDS_AND_MELODY: "Chords & Melody",
+        TabStyle.MELODY: "Solo (Melody Only)",
+        TabStyle.CHORDS: "Chords (Accompaniment)",
+        TabStyle.FINGERSTYLE: "Melody + Bass",
+        TabStyle.CHORDS_AND_MELODY: "Chords + Melody Fills",
     }[style]
 
 
+_STYLE_DESCRIPTIONS: dict[TabStyle, str] = {
+    TabStyle.MELODY: "Single-note melody only — hum/sing along test: you can recognize the song",
+    TabStyle.CHORDS: "Full chord shapes only — works under a singer, no melody line",
+    TabStyle.FINGERSTYLE: "Melody always on top, bass on strong beats — fullest solo sound",
+    TabStyle.CHORDS_AND_MELODY: "Chord shapes at changes, melody fills between phrases — live accompaniment feel",
+}
+
+
 def style_options() -> list[dict[str, str]]:
-    return [{"value": s.value, "label": style_label(s)} for s in TabStyle]
+    return [
+        {"value": s.value, "label": style_label(s), "description": _STYLE_DESCRIPTIONS[s]}
+        for s in TabStyle
+    ]
 
 
 def render_page(body_template: str, page_title: str = "GuitarTabber", **context: object) -> str:
@@ -2529,146 +2540,189 @@ def arrange_tab(
             return (string_index, fret)
         return None
 
-    # --- Style-controlled placement passes ---
-    # MELODY: single-note melody on upper strings only.
-    # CHORDS: chord voicings + bass root, no melody line.
-    # FINGERSTYLE: melody (upper) + alternating bass (lower); optional chord hits.
-    # CHORDS_AND_MELODY: melody on top + fuller chord shapes below (chord-melody style).
-
-    place_melody = style in (TabStyle.MELODY, TabStyle.FINGERSTYLE, TabStyle.CHORDS_AND_MELODY)
-    place_bass = style in (TabStyle.CHORDS, TabStyle.FINGERSTYLE)
-    place_chords = style in (TabStyle.CHORDS, TabStyle.CHORDS_AND_MELODY, TabStyle.FINGERSTYLE)
-    place_inner = style in (TabStyle.CHORDS_AND_MELODY,) and difficulty != TabDifficulty.EASY
-    chord_note_limit = None if style in (TabStyle.CHORDS, TabStyle.CHORDS_AND_MELODY) else (
-        3 if difficulty == TabDifficulty.STANDARD else None
-    )
-
-    if place_melody:
-        for slot, midi_value in display_melody_events:
-            if slot >= display_total_slots:
-                continue
-            # Try treble strings first; fall back to all 6 strings so no note is silently dropped.
-            placed_pos = try_place_midi_at_slot(
-                slot,
-                midi_value,
-                preferred_strings=[5, 4, 3, 2, 1, 0],
-                max_fret=melody_max_fret,
-                prefer_open=False,
-                near_position=last_melody_pos,
-            )
-            if placed_pos is None:
-                # Retry ignoring span limits — a note that lands anywhere is
-                # better than a silent gap.
-                placed_pos = try_place_midi_at_slot(
-                    slot,
-                    midi_value,
-                    preferred_strings=[5, 4, 3, 2, 1, 0],
-                    max_fret=melody_max_fret,
-                    span_limit=99,
-                    prefer_open=False,
-                )
-            if placed_pos is not None:
-                last_melody_pos = placed_pos
-
+    # Build shared lookup used by all modes.
     melody_slots = {slot for slot, _ in display_melody_events if 0 <= slot < display_total_slots}
     melody_pitch_by_slot = {
         slot: midi_value for slot, midi_value in display_melody_events if 0 <= slot < display_total_slots
     }
 
-    if place_bass:
-        last_bass_pos: Optional[tuple[int, int]] = None
-        for slot, midi_value in display_bass_events:
+    # Determine strong beats (beats 1 and 3 in 4/4; beat 1 only otherwise).
+    # Used by FINGERSTYLE mode to place bass only where it counts rhythmically.
+    strong_beat_slots: set[int] = set()
+    for ms_start in display_measure_slots:
+        strong_beat_slots.add(ms_start)  # beat 1 always
+        strong_beat_slots.add(ms_start + 8)  # beat 3 in 4/4 (8 slots = 2 quarter notes)
+
+    def _place_melody_note(slot: int, midi_value: int) -> None:
+        """Place a single melody note. Always succeeds — retries without span limit."""
+        nonlocal last_melody_pos
+        placed = try_place_midi_at_slot(
+            slot, midi_value,
+            preferred_strings=[5, 4, 3, 2, 1, 0],
+            max_fret=melody_max_fret,
+            prefer_open=False,
+            near_position=last_melody_pos,
+        )
+        if placed is None:
+            placed = try_place_midi_at_slot(
+                slot, midi_value,
+                preferred_strings=[5, 4, 3, 2, 1, 0],
+                max_fret=melody_max_fret,
+                span_limit=99,
+                prefer_open=False,
+            )
+        if placed is not None:
+            last_melody_pos = placed
+
+    # -----------------------------------------------------------------------
+    # MODE: SOLO (Melody Only)
+    # Objective: one note at a time, exact melody pitch/rhythm, nothing else.
+    # -----------------------------------------------------------------------
+    if style == TabStyle.MELODY:
+        for slot, midi_value in display_melody_events:
             if slot >= display_total_slots:
                 continue
+            _place_melody_note(slot, midi_value)
+
+    # -----------------------------------------------------------------------
+    # MODE: CHORDS (Accompaniment Only)
+    # Objective: full chord shapes from the library on every chord change.
+    #            No melody line — this is a strumming/backing track arrangement.
+    # -----------------------------------------------------------------------
+    elif style == TabStyle.CHORDS:
+        placed_chord_slots: set[int] = set()
+        for slot, chord_label in display_chord_events:
+            if slot >= display_total_slots or slot in placed_chord_slots:
+                continue
+            shape_midi = chord_label_to_midi(chord_label)
+            if not shape_midi:
+                continue
+            placed_chord_slots.add(slot)
+            for midi_value in shape_midi:
+                try_place_midi_at_slot(
+                    slot, midi_value,
+                    preferred_strings=[0, 1, 2, 3, 4, 5],
+                    max_fret=chord_hit_max_fret,
+                    span_limit=chord_hit_span,
+                )
+        # COMPLETE: also fill detected score chords at beat positions.
+        if difficulty == TabDifficulty.COMPLETE:
+            for slot, chord_label in display_chord_events:
+                if slot >= display_total_slots:
+                    continue
+                try:
+                    symbol = harmony.ChordSymbol(chord_label)
+                    chord_midis = [int(p.midi) for p in symbol.pitches]
+                except Exception:
+                    continue
+                for midi_value in chord_midis[:4]:
+                    try_place_midi_at_slot(
+                        slot, midi_value,
+                        preferred_strings=[2, 3, 1, 4, 0, 5],
+                        max_fret=inner_max_fret,
+                        span_limit=chord_hit_span,
+                    )
+
+    # -----------------------------------------------------------------------
+    # MODE: MELODY + BASS (Fingerstyle)
+    # Objective: melody is ALWAYS the highest note and placed first.
+    #            Bass only on strong beats (1 and 3), lower strings only.
+    #            No chord blocks — just melody + walking/root bass.
+    # -----------------------------------------------------------------------
+    elif style == TabStyle.FINGERSTYLE:
+        # Pass 1: melody — unconditional, always wins string/slot conflicts.
+        for slot, midi_value in display_melody_events:
+            if slot >= display_total_slots:
+                continue
+            _place_melody_note(slot, midi_value)
+
+        # Pass 2: bass on strong beats only (root or lowest available note).
+        last_bass_pos: Optional[tuple[int, int]] = None
+        bass_by_slot = {slot: midi for slot, midi in display_bass_events if slot < display_total_slots}
+        for slot in sorted(strong_beat_slots):
+            if slot >= display_total_slots:
+                continue
+            midi_value = bass_by_slot.get(slot)
+            if midi_value is None:
+                # No explicit bass note — look for the nearest one within 2 slots.
+                for offset in [0, 2, 1, -1, -2]:
+                    midi_value = bass_by_slot.get(slot + offset)
+                    if midi_value is not None:
+                        break
+            if midi_value is None:
+                continue
+            melody_ceiling = melody_pitch_by_slot.get(slot)
             placed = try_place_midi_at_slot(
-                slot, midi_value, preferred_strings=[0, 1, 2, 3],
-                max_fret=bass_max_fret, near_position=last_bass_pos,
-                melody_ceiling=melody_pitch_by_slot.get(slot),
+                slot, midi_value,
+                preferred_strings=[0, 1, 2],
+                max_fret=bass_max_fret,
+                near_position=last_bass_pos,
+                melody_ceiling=melody_ceiling,
             )
             if placed is not None:
                 last_bass_pos = placed
 
-    if place_chords:
-        chord_strings = [0, 1, 2, 3, 4, 5] if style == TabStyle.CHORDS_AND_MELODY else (
-            [0, 1, 2, 3, 4, 5] if difficulty == TabDifficulty.COMPLETE else [0, 1, 2, 3, 4]
-        )
+        # Pass 3 (COMPLETE only): add inner-voice notes on off-beats, staying below melody.
+        if difficulty == TabDifficulty.COMPLETE:
+            for slot, midi_value in display_inner_events:
+                if slot >= display_total_slots or slot in strong_beat_slots:
+                    continue
+                try_place_midi_at_slot(
+                    slot, midi_value,
+                    preferred_strings=[3, 2, 4, 1],
+                    max_fret=inner_max_fret,
+                    span_limit=max_span,
+                    melody_ceiling=melody_pitch_by_slot.get(slot),
+                )
 
-        if style == TabStyle.CHORDS:
-            # Use the standard guitar chord shape library for each labeled chord change.
-            # This gives clean, playable open-position voicings rather than trying to
-            # reconstruct shapes from detected bass notes.
-            placed_chord_slots: set[int] = set()
-            for slot, chord_label in display_chord_events:
-                if slot >= display_total_slots or slot in placed_chord_slots:
-                    continue
-                shape_midi = chord_label_to_midi(chord_label)
-                if not shape_midi:
-                    continue
-                placed_chord_slots.add(slot)
+    # -----------------------------------------------------------------------
+    # MODE: CHORDS + MELODY FILLS (Strum + Licks)
+    # Objective: chord shapes at every chord change; melody notes fill the
+    #            beats where no chord is changing (the "licks" between phrases).
+    # -----------------------------------------------------------------------
+    elif style == TabStyle.CHORDS_AND_MELODY:
+        chord_change_slots: set[int] = {slot for slot, _ in display_chord_events if slot < display_total_slots}
+
+        # Pass 1: full chord shapes at every chord change.
+        for slot, chord_label in display_chord_events:
+            if slot >= display_total_slots:
+                continue
+            shape_midi = chord_label_to_midi(chord_label)
+            if shape_midi:
                 for midi_value in shape_midi:
                     try_place_midi_at_slot(
-                        slot,
-                        midi_value,
-                        preferred_strings=chord_strings,
+                        slot, midi_value,
+                        preferred_strings=[0, 1, 2, 3, 4, 5],
                         max_fret=chord_hit_max_fret,
                         span_limit=chord_hit_span,
                     )
-        else:
-            # FINGERSTYLE / CHORDS_AND_MELODY: use detected score notes for texture.
-            for slot, midi_values in display_played_chord_events:
-                if slot >= display_total_slots:
-                    continue
-                # When melody is present at the same beat, keep accompaniment
-                # on lower strings so the top-line melody remains intact/audible.
-                active_strings = chord_strings
-                if slot in melody_slots and style != TabStyle.CHORDS:
-                    active_strings = [0, 1, 2, 3]
+            else:
+                # Fallback: use detected chord notes if library has no shape.
+                pass
 
+        # Pass 2: melody notes on beats where no chord shape was placed.
+        for slot, midi_value in display_melody_events:
+            if slot >= display_total_slots:
+                continue
+            if slot in chord_change_slots:
+                continue  # chord already owns this beat — don't overwrite
+            _place_melody_note(slot, midi_value)
+
+        # Pass 3 (COMPLETE): fill detected lower-staff chord notes on chord-change slots
+        # so chord shapes have harmonic depth beyond open-position library voicings.
+        if difficulty == TabDifficulty.COMPLETE:
+            for slot, midi_values in display_played_chord_events:
+                if slot >= display_total_slots or slot not in chord_change_slots:
+                    continue
                 unique_values = sorted({normalize_midi_to_guitar_range(v) for v in midi_values})
-                if chord_note_limit is not None and len(unique_values) > chord_note_limit:
-                    unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
-                for midi_value in unique_values:
+                for midi_value in unique_values[:4]:
                     try_place_midi_at_slot(
-                        slot,
-                        midi_value,
-                        preferred_strings=active_strings,
+                        slot, midi_value,
+                        preferred_strings=[0, 1, 2, 3],
                         max_fret=chord_hit_max_fret,
                         span_limit=chord_hit_span,
                         melody_ceiling=melody_pitch_by_slot.get(slot),
                     )
-
-    if place_inner or (style == TabStyle.FINGERSTYLE and difficulty != TabDifficulty.EASY):
-        for slot, midi_value in display_inner_events:
-            if slot >= display_total_slots:
-                continue
-            try_place_midi_at_slot(
-                slot,
-                midi_value,
-                preferred_strings=[3, 2, 4, 1],
-                max_fret=inner_max_fret,
-                span_limit=max_span,
-                melody_ceiling=melody_pitch_by_slot.get(slot),
-            )
-
-    if difficulty == TabDifficulty.COMPLETE and style in (TabStyle.CHORDS,):
-        # In complete + chords-only mode, a little extra fill is okay.
-        for slot, chord_label in display_chord_events:
-            if slot >= display_total_slots:
-                continue
-            try:
-                symbol = harmony.ChordSymbol(chord_label)
-                chord_midis = [int(p.midi) for p in symbol.pitches]
-            except Exception:
-                continue
-            for midi_value in chord_midis[:3]:
-                try_place_midi_at_slot(
-                    slot,
-                    midi_value,
-                    preferred_strings=[2, 3, 1, 4, 0, 5],
-                    max_fret=inner_max_fret,
-                    span_limit=chord_hit_span,
-                    melody_ceiling=melody_pitch_by_slot.get(slot),
-                )
 
     place_measure_dividers(lines, display_measure_slots)
 
