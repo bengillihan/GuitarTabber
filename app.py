@@ -1789,6 +1789,19 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         extras = [(s, m) for s, m in additions if s not in covered]
         return sorted(base + extras, key=lambda x: x[0])
 
+    def collapse_events_by_slot(events: list[tuple[int, int]], prefer: str = "high") -> list[tuple[int, int]]:
+        by_slot: dict[int, int] = {}
+        for slot, midi_value in events:
+            current = by_slot.get(slot)
+            if current is None:
+                by_slot[slot] = midi_value
+                continue
+            if prefer == "low":
+                by_slot[slot] = min(current, midi_value)
+            else:
+                by_slot[slot] = max(current, midi_value)
+        return sorted(by_slot.items(), key=lambda x: x[0])
+
     if parts:
         all_noteheads = sum(
             1 if isinstance(el, note.Note) else len(el.pitches)
@@ -1873,6 +1886,12 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         return v
 
     melody_events = [(s, _to_guitar_range(m)) for s, m in melody_events]
+    bass_events = [(s, _to_guitar_range(m)) for s, m in bass_events]
+
+    # Keep one clear melodic pitch per slot (highest) and one bass pitch (lowest).
+    # This avoids unstable placement when multiple extraction passes disagree.
+    melody_events = collapse_events_by_slot(melody_events, prefer="high")
+    bass_events = collapse_events_by_slot(bass_events, prefer="low")
 
     total_slots = max(melody_max_slot, bass_max_slot)
 
@@ -1985,6 +2004,18 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             if len(midi_values) < 2:
                 continue
             if slot not in seen_played_slots:
+                seen_played_slots.add(slot)
+                played_chord_events.append((slot, midi_values))
+
+    # Also capture top-staff (treble) verticals as chord-hit data so alto/inner voices
+    # appear in the tab rather than only notes from the bass staff.
+    if len(parts) >= 1 and melody_source is not None:
+        treble_verticals = collect_verticals(melody_source)
+        for slot, values in treble_verticals.items():
+            if slot >= total_slots or slot in seen_played_slots:
+                continue
+            midi_values = sorted(values)
+            if len(midi_values) >= 2:
                 seen_played_slots.add(slot)
                 played_chord_events.append((slot, midi_values))
 
@@ -2128,18 +2159,23 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         played_chord_events = simplified_played
 
     inner_events: list[tuple[int, int]] = []
-    if difficulty == TabDifficulty.COMPLETE and parts:
+    if difficulty != TabDifficulty.EASY and parts:
         inner_sources: list[tuple[stream.Stream, Optional[str], str]] = []
+        # Voice 2 of the top staff = alto in SATB arrangements.
         inner_sources.append((parts[0], choose_voice(parts[0], "2"), "high"))
-        if len(parts) > 1:
-            inner_sources.append((parts[-1], choose_voice(parts[-1], "1"), "low"))
-        for mid in parts[1:-1]:
-            inner_sources.append((mid, None, "high"))
+        if difficulty == TabDifficulty.COMPLETE:
+            # Also pull voice 1 of the bass staff (tenor) in COMPLETE mode.
+            if len(parts) > 1:
+                inner_sources.append((parts[-1], choose_voice(parts[-1], "1"), "low"))
+            for mid in parts[1:-1]:
+                inner_sources.append((mid, None, "high"))
+        elif comp_source is not None:
+            inner_sources.append((comp_source, None, "high"))
 
         by_slot: dict[int, list[int]] = {}
         for src, voice_id, mode in inner_sources:
-            events, _ = collect_part_events(src, mode=mode, voice_filter=voice_id)
-            for slot, midi_value in events:
+            evs, _ = collect_part_events(src, mode=mode, voice_filter=voice_id)
+            for slot, midi_value in evs:
                 if slot >= total_slots:
                     continue
                 by_slot.setdefault(slot, []).append(midi_value)
@@ -2148,14 +2184,6 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             if not values:
                 continue
             inner_events.append((slot, values[len(values) // 2]))
-    elif difficulty == TabDifficulty.STANDARD and comp_source is not None:
-        comp_verticals = collect_verticals(comp_source)
-        for slot, values in sorted(comp_verticals.items()):
-            midi_values = sorted(values)
-            if len(midi_values) < 2 or slot >= total_slots:
-                continue
-            # Middle chord tone sits well on D/G strings for accompaniment pulse.
-            inner_events.append((slot, midi_values[len(midi_values) // 2]))
 
     section_events.sort(key=lambda item: item[0])
     played_chord_events.sort(key=lambda item: item[0])
@@ -2327,9 +2355,9 @@ def arrange_tab(
     melody_max_fret = 5 if difficulty == TabDifficulty.EASY else 22
     bass_max_fret = 5 if difficulty == TabDifficulty.EASY else (11 if difficulty == TabDifficulty.COMPLETE else 8)
     inner_max_fret = 9 if difficulty == TabDifficulty.EASY else (14 if difficulty == TabDifficulty.COMPLETE else 10)
-    max_span = 3 if difficulty == TabDifficulty.EASY else 4
-    chord_hit_span = max_span
-    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else (10 if difficulty == TabDifficulty.COMPLETE else 8)
+    max_span = 3 if difficulty == TabDifficulty.EASY else 5
+    chord_hit_span = 4 if difficulty == TabDifficulty.EASY else (6 if difficulty == TabDifficulty.COMPLETE else 5)
+    chord_hit_max_fret = 5 if difficulty == TabDifficulty.EASY else (12 if difficulty == TabDifficulty.COMPLETE else 10)
 
     def normalize_midi_to_guitar_range(midi_value: int) -> int:
         moved = int(midi_value)
@@ -2347,7 +2375,10 @@ def arrange_tab(
         span_limit: Optional[int] = None,
         prefer_open: bool = True,
         near_position: Optional[tuple[int, int]] = None,
+        melody_ceiling: Optional[int] = None,
     ) -> Optional[tuple[int, int]]:
+        if melody_ceiling is not None and midi_value > melody_ceiling:
+            return None
         candidates = find_positions(
             midi_value,
             preferred_strings=preferred_strings,
@@ -2411,13 +2442,22 @@ def arrange_tab(
                 last_melody_pos = placed_pos
 
     melody_slots = {slot for slot, _ in display_melody_events if 0 <= slot < display_total_slots}
-    bass_slots = {slot for slot, _ in display_bass_events if 0 <= slot < display_total_slots}
+    melody_pitch_by_slot = {
+        slot: midi_value for slot, midi_value in display_melody_events if 0 <= slot < display_total_slots
+    }
 
     if place_bass:
+        last_bass_pos: Optional[tuple[int, int]] = None
         for slot, midi_value in display_bass_events:
             if slot >= display_total_slots:
                 continue
-            try_place_midi_at_slot(slot, midi_value, preferred_strings=[0, 1, 2, 3], max_fret=bass_max_fret)
+            placed = try_place_midi_at_slot(
+                slot, midi_value, preferred_strings=[0, 1, 2, 3],
+                max_fret=bass_max_fret, near_position=last_bass_pos,
+                melody_ceiling=melody_pitch_by_slot.get(slot),
+            )
+            if placed is not None:
+                last_bass_pos = placed
 
     if place_chords:
         chord_strings = [0, 1, 2, 3, 4, 5] if style == TabStyle.CHORDS_AND_MELODY else (
@@ -2456,11 +2496,6 @@ def arrange_tab(
                     active_strings = [0, 1, 2, 3]
 
                 unique_values = sorted({normalize_midi_to_guitar_range(v) for v in midi_values})
-                # Favor compact accompaniment: avoid dense vertical stacks that
-                # fight melody and lead to unplayable grips.
-                if slot in melody_slots:
-                    if unique_values:
-                        unique_values = [unique_values[0], unique_values[-1]] if len(unique_values) >= 2 else unique_values
                 if chord_note_limit is not None and len(unique_values) > chord_note_limit:
                     unique_values = [unique_values[0], unique_values[len(unique_values) // 2], unique_values[-1]]
                 for midi_value in unique_values:
@@ -2470,13 +2505,21 @@ def arrange_tab(
                         preferred_strings=active_strings,
                         max_fret=chord_hit_max_fret,
                         span_limit=chord_hit_span,
+                        melody_ceiling=melody_pitch_by_slot.get(slot),
                     )
 
     if place_inner or (style == TabStyle.FINGERSTYLE and difficulty != TabDifficulty.EASY):
         for slot, midi_value in display_inner_events:
             if slot >= display_total_slots:
                 continue
-            try_place_midi_at_slot(slot, midi_value, preferred_strings=[3, 2, 4, 1], max_fret=inner_max_fret, span_limit=max_span)
+            try_place_midi_at_slot(
+                slot,
+                midi_value,
+                preferred_strings=[3, 2, 4, 1],
+                max_fret=inner_max_fret,
+                span_limit=max_span,
+                melody_ceiling=melody_pitch_by_slot.get(slot),
+            )
 
     if difficulty == TabDifficulty.COMPLETE and style in (TabStyle.CHORDS,):
         # In complete + chords-only mode, a little extra fill is okay.
@@ -2495,6 +2538,7 @@ def arrange_tab(
                     preferred_strings=[2, 3, 1, 4, 0, 5],
                     max_fret=inner_max_fret,
                     span_limit=chord_hit_span,
+                    melody_ceiling=melody_pitch_by_slot.get(slot),
                 )
 
     place_measure_dividers(lines, display_measure_slots)
