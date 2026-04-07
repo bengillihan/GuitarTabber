@@ -424,6 +424,17 @@ BASE_PAGE = """
       color: #9ca3af;
       margin-top: 0.4rem;
     }
+    .score-badge {
+      display: inline-block;
+      padding: 0.1rem 0.45rem;
+      border-radius: 4px;
+      font-weight: 700;
+      font-size: 0.88rem;
+    }
+    .score-good { background: #dcfce7; color: #166534; }
+    .score-ok   { background: #fef9c3; color: #713f12; }
+    .score-low  { background: #fee2e2; color: #991b1b; }
+    .score-hint { font-size: 0.78rem; color: #9ca3af; }
     @media (max-width: 700px) {
       body {
         padding: 1rem;
@@ -611,6 +622,15 @@ HOME_BODY = """
       <div class="warning">{{ result.truncation_warning }}</div>
     {% endif %}
 <p class="meta"><strong>Saved arrangement:</strong> <a href="{{ result.arrangement_url }}">Open permalink</a> | <a href="{{ result.download_url }}">Download tab (.txt)</a> | <a href="{{ result.download_original_url }}">Download original file</a></p>
+{% if result.accuracy_score is not none %}
+<p class="meta">
+  <strong>Coverage:</strong>
+  <span class="score-badge {% if result.accuracy_score >= 80 %}score-good{% elif result.accuracy_score >= 50 %}score-ok{% else %}score-low{% endif %}">{{ result.accuracy_score }}%</span>
+  &nbsp;
+  <strong>Playability:</strong>
+  <span class="score-badge {% if result.playability_score >= 80 %}score-good{% elif result.playability_score >= 50 %}score-ok{% else %}score-low{% endif %}">{{ result.playability_score }}%</span>
+</p>
+{% endif %}
     <div class="tab-controls">
       <label>Tab text size: <span class="tab-size-value">15.0</span>px</label>
       <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
@@ -663,6 +683,16 @@ ARRANGEMENT_BODY = """
 <p class="meta"><strong>Estimated key:</strong> {{ row.key_name }}</p>
 <p class="meta"><strong>Style:</strong> {{ row.style_label }} &nbsp;|&nbsp; <strong>Complexity:</strong> {{ row.difficulty_label }}</p>
 <p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
+{% if row.accuracy_score is not none and row.playability_score is not none %}
+<p class="meta">
+  <strong>Coverage:</strong>
+  <span class="score-badge {% if row.accuracy_score >= 80 %}score-good{% elif row.accuracy_score >= 50 %}score-ok{% else %}score-low{% endif %}">{{ row.accuracy_score }}%</span>
+  &nbsp;
+  <strong>Playability:</strong>
+  <span class="score-badge {% if row.playability_score >= 80 %}score-good{% elif row.playability_score >= 50 %}score-ok{% else %}score-low{% endif %}">{{ row.playability_score }}%</span>
+  <span class="score-hint">— scores update when you reprocess or save a new arrangement</span>
+</p>
+{% endif %}
 <p class="meta"><strong>Saved:</strong> {{ row.created_at }}</p>
 <p class="meta">
   <a href="{{ url_for('download_arrangement', arrangement_id=row.id) }}">Download tab (.txt)</a>
@@ -791,6 +821,8 @@ class Arrangement(db.Model):
     capo_suggestion = db.Column(db.String(120), nullable=False, default="No suggestion")
     tab_text = db.Column(db.Text, nullable=False)
     tab_html = db.Column(db.Text, nullable=True)
+    accuracy_score = db.Column(db.Integer, nullable=True)
+    playability_score = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime(timezone=True), server_default=db.func.now(), nullable=False)
 
 
@@ -845,6 +877,14 @@ with app.app_context():
     _safe_add_column(
         "ALTER TABLE songs ADD COLUMN IF NOT EXISTS original_file_mime_type VARCHAR(120)",
         "ALTER TABLE songs ADD COLUMN original_file_mime_type VARCHAR(120)",
+    )
+    _safe_add_column(
+        "ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS accuracy_score INTEGER",
+        "ALTER TABLE arrangements ADD COLUMN accuracy_score INTEGER",
+    )
+    _safe_add_column(
+        "ALTER TABLE arrangements ADD COLUMN IF NOT EXISTS playability_score INTEGER",
+        "ALTER TABLE arrangements ADD COLUMN playability_score INTEGER",
     )
     db.session.commit()
 
@@ -1445,6 +1485,93 @@ def build_lyric_line(total_slots: int, lyric_events: list[tuple[int, str]]) -> s
             if pos < len(line):
                 line[pos] = ch
     return "".join(line).rstrip()
+
+
+def score_placement(
+    lines: dict[int, list[str]],
+    display_melody_events: list[tuple[int, int]],
+    display_total_slots: int,
+) -> tuple[int, int]:
+    """Return (accuracy_score, playability_score) each 0–100.
+
+    accuracy   — what fraction of melody slots have any fret placed on them.
+    playability — penalises fret-span violations and large position jumps.
+    """
+    # --- Accuracy ---
+    melody_slots_in_range = [s for s, _ in display_melody_events if s < display_total_slots]
+    placed_count = 0
+    for slot in melody_slots_in_range:
+        char_start = slot * SLOT_WIDTH
+        char_end = char_start + SLOT_WIDTH
+        for string_idx in range(6):
+            seg = lines[string_idx][char_start:char_end]
+            if any(c.isdigit() for c in seg):
+                placed_count += 1
+                break
+    accuracy = int(100 * placed_count / max(1, len(melody_slots_in_range)))
+
+    # --- Playability ---
+    # Build slot → list[fret] from all strings.
+    slot_frets: dict[int, list[int]] = {}
+    melody_fret_sequence: list[int] = []
+    for string_idx in range(6):
+        line = lines[string_idx]
+        i = 0
+        while i < len(line):
+            if line[i].isdigit():
+                j = i
+                while j < len(line) and line[j].isdigit():
+                    j += 1
+                fret = int("".join(line[i:j]))
+                slot = i // SLOT_WIDTH
+                slot_frets.setdefault(slot, []).append(fret)
+                i = j
+            else:
+                i += 1
+    # Collect melody fret sequence (highest string with a digit per melody slot).
+    for slot in sorted(melody_slots_in_range):
+        char_start = slot * SLOT_WIDTH
+        char_end = char_start + SLOT_WIDTH
+        for string_idx in [5, 4, 3, 2, 1, 0]:
+            seg = "".join(lines[string_idx][char_start:char_end]).strip("- |")
+            if seg.isdigit():
+                melody_fret_sequence.append(int(seg))
+                break
+
+    penalty = 0.0
+    total_weight = 0.0
+
+    # Span penalty: each slot with fretted notes more than MAX_FRETTED_SPAN apart.
+    for slot, frets in slot_frets.items():
+        fretted = [f for f in frets if f > 0]
+        if len(fretted) >= 2:
+            span = max(fretted) - min(fretted)
+            if span > MAX_FRETTED_SPAN:
+                penalty += (span - MAX_FRETTED_SPAN) * 3
+                total_weight += 10
+
+    # Jump penalty: large fret-position leaps in melody.
+    for i in range(1, len(melody_fret_sequence)):
+        jump = abs(melody_fret_sequence[i] - melody_fret_sequence[i - 1])
+        total_weight += 5
+        if jump > 7:
+            penalty += (jump - 7) * 1.5
+        elif jump > 4:
+            penalty += (jump - 4) * 0.5
+
+    # High-fret penalty.
+    for fret in melody_fret_sequence:
+        total_weight += 2
+        if fret > 12:
+            penalty += (fret - 12) * 0.5
+
+    if total_weight == 0:
+        playability = 100
+    else:
+        raw = max(0.0, 1.0 - penalty / total_weight)
+        playability = int(raw * 100)
+
+    return accuracy, playability
 
 
 def simplify_chord_label(label: str) -> str:
@@ -2308,7 +2435,7 @@ def arrange_tab(
     score: stream.Score,
     difficulty: TabDifficulty = TabDifficulty.STANDARD,
     style: TabStyle = TabStyle.FINGERSTYLE,
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, int, int]:
     events = gather_events(score, difficulty=difficulty)
     measure_starts = sorted({slot for slot in events.measure_slots if 0 <= slot < events.total_slots})
     if not measure_starts or measure_starts[0] != 0:
@@ -2659,7 +2786,8 @@ def arrange_tab(
 
     tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
     tab_plain = "\n\n".join(plain_rows)
-    return tab_html, tab_plain, events.was_truncated
+    accuracy, playability = score_placement(lines, display_melody_events, display_total_slots)
+    return tab_html, tab_plain, events.was_truncated, accuracy, playability
 
 
 def suggest_capo(key_name: str) -> str:
@@ -2758,7 +2886,7 @@ def render_score_to_tab_payload(
                 score = transpose_score_between_keys(score, key_name, play_key)
                 key_name = play_key
 
-    tab_html, tab_plain, was_truncated = arrange_tab(score, difficulty=difficulty, style=style)
+    tab_html, tab_plain, was_truncated, accuracy_score, playability_score = arrange_tab(score, difficulty=difficulty, style=style)
     header = [
         f"# {title}",
         f"# Source file: {source_label}",
@@ -2773,6 +2901,8 @@ def render_score_to_tab_payload(
         "style": style.value,
         "tab_text": "\n".join(header) + tab_plain,
         "tab_html": tab_html,
+        "accuracy_score": accuracy_score,
+        "playability_score": playability_score,
         "truncation_warning": (
             f"This score was truncated for display at {MAX_SLOTS} tab slots. Split into sections for full output."
             if was_truncated
@@ -3102,6 +3232,8 @@ def index():
                     capo_suggestion=parsed["capo_suggestion"],
                     tab_text=parsed["tab_text"],
                     tab_html=parsed["tab_html"],
+                    accuracy_score=parsed.get("accuracy_score"),
+                    playability_score=parsed.get("playability_score"),
                 )
                 db.session.add(arrangement)
                 db.session.commit()
@@ -3119,6 +3251,8 @@ def index():
                     "arrangement_url": url_for("view_arrangement", arrangement_id=arrangement.id),
                     "download_url": url_for("download_arrangement", arrangement_id=arrangement.id),
                     "download_original_url": url_for("download_original", arrangement_id=arrangement.id),
+                    "accuracy_score": parsed.get("accuracy_score"),
+                    "playability_score": parsed.get("playability_score"),
                 }
             except OMRConversionError as exc:
                 db.session.rollback()
@@ -3190,6 +3324,8 @@ def view_arrangement(arrangement_id: int):
             Song.title.label("song_title"),
             Song.original_filename.label("original_filename"),
             (Song.original_file_data != None).label("has_original"),  # noqa: E711
+            Arrangement.accuracy_score.label("accuracy_score"),
+            Arrangement.playability_score.label("playability_score"),
         )
         .join(Song, Arrangement.song_id == Song.id)
         .filter(Arrangement.id == arrangement_id)
@@ -3225,6 +3361,8 @@ def view_arrangement(arrangement_id: int):
         "song_title": row.song_title,
         "original_filename": row.original_filename,
         "has_original": bool(row.has_original),
+        "accuracy_score": row.accuracy_score,
+        "playability_score": row.playability_score,
     }
 
     def load_score_for_arrangement() -> stream.Score:
@@ -3333,6 +3471,8 @@ def view_arrangement(arrangement_id: int):
                             capo_suggestion=rendered["capo_suggestion"],
                             tab_text=rendered["tab_text"],
                             tab_html=rendered["tab_html"],
+                            accuracy_score=rendered.get("accuracy_score"),
+                            playability_score=rendered.get("playability_score"),
                         )
                         db.session.add(new_arrangement)
                         db.session.commit()
@@ -3370,6 +3510,8 @@ def view_arrangement(arrangement_id: int):
                 display["style"] = rendered["style"]
                 display["style_label"] = style_label(selected_style)
                 display["capo_suggestion"] = rendered["capo_suggestion"]
+                display["accuracy_score"] = rendered.get("accuracy_score")
+                display["playability_score"] = rendered.get("playability_score")
 
                 save_requested = (transpose_action == "save") or (note_edit_action == "save")
                 if save_requested:
@@ -3381,6 +3523,8 @@ def view_arrangement(arrangement_id: int):
                         capo_suggestion=rendered["capo_suggestion"],
                         tab_text=rendered["tab_text"],
                         tab_html=rendered["tab_html"],
+                        accuracy_score=rendered.get("accuracy_score"),
+                        playability_score=rendered.get("playability_score"),
                     )
                     db.session.add(new_arrangement)
                     db.session.commit()
