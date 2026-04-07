@@ -689,6 +689,8 @@ ARRANGEMENT_BODY = """
   </select>
   <button type="submit" name="transpose_action" value="preview">Update Tab</button>
   <button type="submit" name="transpose_action" value="save">Save As New Arrangement</button>
+  <button type="submit" name="source_action" value="reprocess_preview">Reprocess Source (Preview)</button>
+  <button type="submit" name="source_action" value="reprocess_save">Reprocess Source (Save New)</button>
 </form>
 {% if transpose_error %}
   <div class="error">{{ transpose_error }}</div>
@@ -3015,6 +3017,24 @@ def parse_sheet_to_tab(
     }
 
 
+def reprocess_uploaded_bytes_to_tab(
+    file_bytes: bytes,
+    filename: str,
+    difficulty: TabDifficulty = TabDifficulty.STANDARD,
+    style: TabStyle = TabStyle.FINGERSTYLE,
+) -> dict[str, Any]:
+    request_id = uuid4().hex[:10]
+    request_dir = UPLOAD_DIR / "requests" / f"reprocess-{request_id}"
+    request_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = secure_filename(filename) or "reprocess-input.musicxml"
+    saved_path = request_dir / safe_name
+    saved_path.write_bytes(file_bytes)
+    try:
+        return parse_sheet_to_tab(saved_path, safe_name, request_dir, difficulty=difficulty, style=style)
+    finally:
+        shutil.rmtree(request_dir, ignore_errors=True)
+
+
 @app.errorhandler(413)
 def request_entity_too_large(_error):
     message = f"File is too large. Please upload a file up to {MAX_UPLOAD_MB} MB."
@@ -3229,33 +3249,119 @@ def view_arrangement(arrangement_id: int):
         selected_difficulty = parse_difficulty(request.form.get("target_difficulty"))
         selected_style = parse_style(request.form.get("target_style"))
         transpose_action = (request.form.get("transpose_action") or "preview").strip().lower()
+        source_action = (request.form.get("source_action") or "").strip().lower()
         note_edit_action = (request.form.get("note_edit_action") or "").strip().lower()
         selected_remove_ids = set(request.form.getlist("remove_note_ids"))
 
         if selected_key not in key_options:
             if note_edit_action:
                 note_edit_error = "Please choose a valid target key."
+            elif source_action:
+                transpose_error = "Please choose a valid target key."
             else:
                 transpose_error = "Please choose a valid target key."
         else:
             try:
-                score = load_score_for_arrangement()
-                transposed = transpose_score_between_keys(score, row.key_name, selected_key)
+                if source_action in {"reprocess_preview", "reprocess_save"}:
+                    source_row = (
+                        db.session.query(
+                            Song.original_file_data.label("original_file_data"),
+                            Song.original_filename.label("original_filename"),
+                            Song.file_data.label("file_data"),
+                        )
+                        .join(Arrangement, Arrangement.song_id == Song.id)
+                        .filter(Arrangement.id == arrangement_id)
+                        .first()
+                    )
+                    if source_row is None:
+                        raise ScoreParseError("Stored source file not found for this arrangement.")
+                    source_bytes = source_row.original_file_data or source_row.file_data
+                    source_name = source_row.original_filename or row.original_filename
+                    if not source_bytes:
+                        raise ScoreParseError("Stored source file not found for this arrangement.")
 
-                # Rebuild editor catalog in the current key preview context.
-                note_catalog = build_note_catalog(transposed)
-                if selected_remove_ids:
-                    transposed = remove_notes_by_ids(transposed, selected_remove_ids)
+                    parsed = reprocess_uploaded_bytes_to_tab(
+                        source_bytes,
+                        source_name,
+                        difficulty=selected_difficulty,
+                        style=selected_style,
+                    )
 
-                source_label = f"{row.original_filename} (transposed to {selected_key})"
-                rendered = render_score_to_tab_payload(
-                    transposed,
-                    row.song_title,
-                    source_label,
-                    forced_key_name=selected_key,
-                    difficulty=selected_difficulty,
-                    style=selected_style,
-                )
+                    # Allow optional key change after fresh reprocess.
+                    if selected_key != parsed["key_name"]:
+                        reprocessed_score = parse_musicxml_bytes(parsed["musicxml_bytes"])
+                        transposed = transpose_score_between_keys(reprocessed_score, parsed["key_name"], selected_key)
+                        note_catalog = build_note_catalog(transposed)
+                        source_label = f"{source_name} (reprocessed, transposed to {selected_key})"
+                        rendered = render_score_to_tab_payload(
+                            transposed,
+                            row.song_title,
+                            source_label,
+                            forced_key_name=selected_key,
+                            difficulty=selected_difficulty,
+                            style=selected_style,
+                        )
+                    else:
+                        preview_score = parse_musicxml_bytes(parsed["musicxml_bytes"])
+                        note_catalog = build_note_catalog(preview_score)
+                        rendered = {
+                            "key_name": parsed["key_name"],
+                            "capo_suggestion": parsed["capo_suggestion"],
+                            "difficulty": parsed["difficulty"],
+                            "style": parsed["style"],
+                            "tab_text": parsed["tab_text"],
+                            "tab_html": parsed["tab_html"],
+                            "truncation_warning": parsed["truncation_warning"],
+                        }
+
+                    if source_action == "reprocess_save":
+                        new_song = Song(
+                            title=parsed["song_title"],
+                            original_filename=source_name,
+                            mime_type=parsed["musicxml_mime_type"],
+                            file_data=parsed["musicxml_bytes"],
+                            original_file_data=source_row.original_file_data or source_bytes,
+                            original_file_mime_type=None,
+                        )
+                        db.session.add(new_song)
+                        db.session.flush()
+                        new_arrangement = Arrangement(
+                            song_id=new_song.id,
+                            key_name=rendered["key_name"],
+                            difficulty=rendered["difficulty"],
+                            style=rendered["style"],
+                            capo_suggestion=rendered["capo_suggestion"],
+                            tab_text=rendered["tab_text"],
+                            tab_html=rendered["tab_html"],
+                        )
+                        db.session.add(new_arrangement)
+                        db.session.commit()
+                        return redirect(url_for("view_arrangement", arrangement_id=new_arrangement.id))
+
+                    transpose_note = (
+                        f"Showing reprocessed preview: {style_label(selected_style)}, {selected_key}, "
+                        f"{difficulty_label(selected_difficulty)}. Saved arrangement remains unchanged."
+                    )
+                    if rendered["truncation_warning"]:
+                        transpose_note = f"{transpose_note} {rendered['truncation_warning']}"
+                else:
+                    score = load_score_for_arrangement()
+                    transposed = transpose_score_between_keys(score, row.key_name, selected_key)
+
+                    # Rebuild editor catalog in the current key preview context.
+                    note_catalog = build_note_catalog(transposed)
+                    if selected_remove_ids:
+                        transposed = remove_notes_by_ids(transposed, selected_remove_ids)
+
+                    source_label = f"{row.original_filename} (transposed to {selected_key})"
+                    rendered = render_score_to_tab_payload(
+                        transposed,
+                        row.song_title,
+                        source_label,
+                        forced_key_name=selected_key,
+                        difficulty=selected_difficulty,
+                        style=selected_style,
+                    )
                 display["tab_text"] = rendered["tab_text"]
                 display["tab_html"] = rendered["tab_html"]
                 display["key_name"] = rendered["key_name"]
@@ -3280,7 +3386,10 @@ def view_arrangement(arrangement_id: int):
                     db.session.commit()
                     return redirect(url_for("view_arrangement", arrangement_id=new_arrangement.id))
 
-                if note_edit_action:
+                if source_action:
+                    # message already set above
+                    pass
+                elif note_edit_action:
                     note_edit_note = (
                         f"Previewing edited notes: removed {len(selected_remove_ids)} note(s), "
                         f"{style_label(selected_style)}, {selected_key}, {difficulty_label(selected_difficulty)}. "
@@ -3299,6 +3408,8 @@ def view_arrangement(arrangement_id: int):
                 db.session.rollback()
                 if note_edit_action:
                     note_edit_error = f"Could not update note edits: {exc}"
+                elif source_action:
+                    transpose_error = f"Could not reprocess this arrangement: {exc}"
                 else:
                     transpose_error = f"Could not update this arrangement: {exc}"
 
