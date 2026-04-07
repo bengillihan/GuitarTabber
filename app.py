@@ -603,6 +603,7 @@ HOME_BODY = """
   </select>
   <button type="submit">Generate Tab</button>
 </form>
+<p class="hint"><strong>Mode intent:</strong> Solo = melody only, Chords = accompaniment only, Melody + Bass = melody-first with supportive bass, Chords + Melody Fills = rhythm chords with melodic fills.</p>
 <div id="processing">Processing upload... OMR on PDFs/images can take up to a minute.</div>
 
 {% if error %}
@@ -614,6 +615,7 @@ HOME_BODY = """
     <h2>{{ result.title }}</h2>
     <p class="meta"><strong>Uploaded file:</strong> {{ result.filename }}</p>
     <p class="meta"><strong>Style:</strong> {{ result.style_label }} &nbsp;|&nbsp; <strong>Complexity:</strong> {{ result.difficulty_label }}</p>
+    <p class="meta"><strong>Style objective:</strong> {{ result.style_goal }}</p>
     <p class="meta"><strong>Estimated key:</strong> {{ result.key_name }} | <strong>Capo suggestion:</strong> {{ result.capo_suggestion }}</p>
     {% if result.multi_page_warning %}
       <div class="warning">{{ result.multi_page_warning }}</div>
@@ -682,6 +684,7 @@ ARRANGEMENT_BODY = """
 <p class="meta"><strong>Original file:</strong> {{ row.original_filename }}</p>
 <p class="meta"><strong>Estimated key:</strong> {{ row.key_name }}</p>
 <p class="meta"><strong>Style:</strong> {{ row.style_label }} &nbsp;|&nbsp; <strong>Complexity:</strong> {{ row.difficulty_label }}</p>
+<p class="meta"><strong>Style objective:</strong> {{ row.style_goal }}</p>
 <p class="meta"><strong>Capo suggestion:</strong> {{ row.capo_suggestion }}</p>
 {% if row.accuracy_score is not none and row.playability_score is not none %}
 <p class="meta">
@@ -947,6 +950,10 @@ def style_options() -> list[dict[str, str]]:
         {"value": s.value, "label": style_label(s), "description": _STYLE_DESCRIPTIONS[s]}
         for s in TabStyle
     ]
+
+
+def style_goal(style: TabStyle) -> str:
+    return _STYLE_DESCRIPTIONS.get(style, "Melody-first guitar arrangement")
 
 
 def render_page(body_template: str, page_title: str = "GuitarTabber", **context: object) -> str:
@@ -3297,6 +3304,7 @@ def index():
                     "filename": safe_name,
                     "key_name": parsed["key_name"],
                     "style_label": style_label(selected_style),
+                    "style_goal": style_goal(selected_style),
                     "difficulty_label": difficulty_label(selected_difficulty),
                     "capo_suggestion": parsed["capo_suggestion"],
                     "truncation_warning": parsed["truncation_warning"],
@@ -3410,6 +3418,7 @@ def view_arrangement(arrangement_id: int):
         "difficulty_label": difficulty_label(selected_difficulty),
         "style": selected_style.value,
         "style_label": style_label(selected_style),
+        "style_goal": style_goal(selected_style),
         "capo_suggestion": row.capo_suggestion,
         "created_at": created_label,
         "song_title": row.song_title,
@@ -3563,6 +3572,7 @@ def view_arrangement(arrangement_id: int):
                 display["difficulty_label"] = difficulty_label(selected_difficulty)
                 display["style"] = rendered["style"]
                 display["style_label"] = style_label(selected_style)
+                display["style_goal"] = style_goal(selected_style)
                 display["capo_suggestion"] = rendered["capo_suggestion"]
                 display["accuracy_score"] = rendered.get("accuracy_score")
                 display["playability_score"] = rendered.get("playability_score")
