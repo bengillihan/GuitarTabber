@@ -27,15 +27,18 @@ Open `http://127.0.0.1:5000` and upload a sheet music file.
 - Section/repeat markers (when detected in MusicXML)
 - Playability filter — fret span limit prevents unplayable simultaneous positions
 - Key estimation + capo suggestion
+- Built-in quality scoring per arrangement:
+  - **Accuracy score** (melody/chord coverage)
+  - **Playability score** (fret-span/fret-range friendliness)
 
 ### Arrangement styles
 
 | Style | What's included |
 |---|---|
-| **Melody Only** | Single-note melody line on upper strings; chord labels above |
-| **Chords Only** | Standard open-position guitar chord shapes from a built-in voicing library; chord labels above |
-| **Fingerstyle** | Melody (upper strings) + alternating bass (lower strings) — classic fingerpicking |
-| **Chords & Melody** | Full chord shapes with melody on top — chord-melody style |
+| **Solo (Melody Only)** | Single-note melody line (melody objective only) |
+| **Chords (Accompaniment Only)** | Chord-shape accompaniment (no melody objective) |
+| **Melody + Bass (Light Fingerstyle)** | Melody-first with supportive bass movement on strong beats |
+| **Chords + Melody Fills** | Chord changes with melody fills between chord events |
 
 ### Complexity levels
 
@@ -49,13 +52,23 @@ Applied on top of the style:
 
 - **Change key** — transpose and preview in any key, or save as a new arrangement
 - **Change style or complexity** — re-render any saved song without re-uploading
+- **Reprocess source** — rerun OMR/parsing from the original uploaded file with new style/complexity settings
 - **Permalink** — every arrangement gets a stable URL
 - **Download .txt** — plain-text tab
+- **Download original file** — recover the original upload from a saved arrangement
+- **Transcribed Notes Editor** — preview/save a version with selected notes removed (interactive note pruning)
 
 ### Tab display
 
 - Text-size slider (8–20 px)
 - Fit-to-screen button — auto-shrinks to avoid horizontal scroll
+- Clickable fret annotations in HTML output for note-edit workflows
+
+## Upload limits
+
+- Default max upload size: **20 MB**
+- Configurable via `MAX_UPLOAD_MB` environment variable (clamped to `5..100`)
+- Friendly `413` response when files exceed the configured limit
 
 ## PDF / Image / Camera Photo Uploads (OMR)
 
@@ -118,9 +131,11 @@ Without it, the rest of the camera pipeline still runs and gives meaningful impr
 - Tables (`songs`, `arrangements`) are auto-created at startup.
 - Schema migrations for new columns run automatically — existing data is preserved.
 - Visit `/history` to browse saved arrangements.
+- Saved songs include both:
+  - normalized MusicXML bytes used for rendering
+  - original uploaded file bytes for reprocess/download flows
 
 ## Next steps
 
 - Add MuseScore to the Railway Dockerfile for production OMR quality
-- Lyrics display alongside tab to help with chord alignment
 - Add confidence/debug panel (detected parts, note counts per pass, key/chord sources)
