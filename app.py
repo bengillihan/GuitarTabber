@@ -129,26 +129,65 @@ _CHORD_SHAPES: dict[str, list[Optional[int]]] = {
 }
 
 
+def lookup_chord_shape(label: str) -> Optional[list[Optional[int]]]:
+    """Return the open-position shape for `label`, low E to high e.
+
+    None in the shape means that string is muted. Falls back through
+    enharmonic roots and, for slash chords, the chord above the bass note.
+    """
+    cleaned = (label or "").strip()
+    if not cleaned:
+        return None
+    shape = _CHORD_SHAPES.get(cleaned)
+    if shape is not None:
+        return shape
+    root_only = re.match(r"^([A-G][b#]?)(.*)$", cleaned)
+    if root_only:
+        root, quality = root_only.groups()
+        enharmonic = {
+            "C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
+            "Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#",
+        }
+        alt_root = enharmonic.get(root)
+        if alt_root:
+            shape = _CHORD_SHAPES.get(f"{alt_root}{quality}")
+            if shape is not None:
+                return shape
+    if "/" in cleaned:
+        return lookup_chord_shape(cleaned.split("/", 1)[0])
+    return None
+
+
+def chord_bass_midi(label: str) -> Optional[int]:
+    """Lowest open-shape pitch for `label`, for fingerstyle bass on a lead sheet."""
+    shape = lookup_chord_shape(label)
+    if shape is not None:
+        sounding = [
+            STANDARD_TUNING[string_index] + fret
+            for string_index, fret in enumerate(shape)
+            if isinstance(fret, int)
+        ]
+        return min(sounding) if sounding else None
+    try:
+        symbol = harmony.ChordSymbol(label)
+        bass_pitch = symbol.bass() if symbol.bass() is not None else symbol.root()
+        bass = int(bass_pitch.midi)
+    except Exception:
+        return None
+    while bass > 52:
+        bass -= 12
+    while bass < GUITAR_MIN_MIDI:
+        bass += 12
+    return bass
+
+
 def chord_label_to_midi(label: str) -> list[int]:
     """
     Return MIDI note values for the standard guitar voicing of `label`.
     Falls back to music21 chord construction if no shape is in the library.
     Returns an empty list if the chord cannot be resolved.
     """
-    # Direct lookup, then try stripping quality variations.
-    shape = _CHORD_SHAPES.get(label)
-    if shape is None:
-        # Try the root only (e.g. "C#" → look for "Db" enharmonic).
-        root_only = re.match(r"^([A-G][b#]?)(.*)$", label)
-        if root_only:
-            root, quality = root_only.groups()
-            # Enharmonic mapping for roots.
-            enharmonic = {"C#": "Db", "D#": "Eb", "F#": "Gb", "G#": "Ab", "A#": "Bb",
-                          "Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
-            alt_root = enharmonic.get(root)
-            if alt_root:
-                shape = _CHORD_SHAPES.get(f"{alt_root}{quality}")
-
+    shape = lookup_chord_shape(label)
     if shape is not None:
         midi_values: list[int] = []
         for string_index, fret in enumerate(shape):
@@ -410,6 +449,84 @@ BASE_PAGE = """
       margin-top: 0.3rem;
       padding-left: 1.4rem;
     }
+    .view-label {
+      margin: 1.1rem 0 0.35rem;
+      font-size: 1.05rem;
+    }
+    .chord-chart {
+      margin-top: 0.4rem;
+    }
+    .chart-tuning {
+      margin: 0 0 0.6rem;
+      color: #5f5a47;
+      font-size: 0.92rem;
+    }
+    .chart-diagrams {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.85rem 1rem;
+      margin: 0.2rem 0 1rem;
+    }
+    .chord-diagram {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-width: 4.6rem;
+    }
+    .chord-diagram-name {
+      font-weight: 700;
+      color: #2e7d32;
+      margin-bottom: 0.15rem;
+    }
+    .chord-diagram-missing {
+      color: #8a8474;
+      font-size: 0.78rem;
+      margin-top: 0.2rem;
+    }
+    .chord-svg {
+      display: block;
+    }
+    .chart-block {
+      margin: 0.35rem 0 0.9rem;
+    }
+    .chart-section {
+      margin: 0.55rem 0 0.25rem;
+      color: #5f5a47;
+      font-size: 0.92rem;
+      font-weight: 700;
+    }
+    .chart-line {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      gap: 0.15rem 0.55rem;
+      margin: 0.15rem 0 0.45rem;
+    }
+    .chart-word {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .chart-chord {
+      min-height: 1.15em;
+      color: #2e7d32;
+      font-weight: 700;
+      font-size: 0.95rem;
+      white-space: nowrap;
+    }
+    .chart-syll {
+      font-size: 1.05rem;
+      line-height: 1.35;
+      white-space: nowrap;
+    }
+    .chart-syll-alt {
+      color: #5a5140;
+      font-size: 0.98rem;
+    }
+    .chart-intro .chart-chord {
+      margin-right: 0.85rem;
+      font-size: 1.05rem;
+    }
     .ft {
       cursor: pointer;
       border-radius: 2px;
@@ -618,7 +735,7 @@ HOME_BODY = """
   <h1>GuitarTabber</h1>
   <a href="{{ url_for('history') }}">View History</a>
 </div>
-<p>Upload sheet music (MusicXML, PDF, or image) and get a guitar tab.</p>
+<p>Upload sheet music (MusicXML, PDF, or image) and get a chord chart plus a guitar tab.</p>
 <p class="hint">Supported formats: .musicxml, .xml, .mxl, .pdf, .png, .jpg, .jpeg, .webp, .heic, .heif</p>
 <p class="hint">Max upload size: {{ max_upload_mb }} MB</p>
 
@@ -695,7 +812,6 @@ HOME_BODY = """
       <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
       <button type="button" class="tab-fit-btn">Fit To Screen</button>
     </div>
-    <p class="tab-edit-hint">Click any fret number to remove that note.</p>
     {{ result.tab_html|safe }}
   </section>
 {% endif %}
@@ -800,7 +916,6 @@ ARRANGEMENT_BODY = """
     <input class="tab-size-range" type="range" min="8" max="20" step="0.5" value="15">
     <button type="button" class="tab-fit-btn">Fit To Screen</button>
   </div>
-  <p class="tab-edit-hint">Click any fret number to remove that note.</p>
   {{ row.tab_html|safe }}
 {% else %}
   <pre>{{ row.tab_text }}</pre>
@@ -887,6 +1002,14 @@ class Arrangement(db.Model):
 
 
 @dataclass
+class LyricToken:
+    slot: int
+    text: str
+    syllabic: str
+    verse: int
+
+
+@dataclass
 class ScoreEvents:
     melody_events: list[tuple[int, int]]
     bass_events: list[tuple[int, int]]
@@ -896,6 +1019,7 @@ class ScoreEvents:
     chord_events: list[tuple[int, str]]
     section_events: list[tuple[int, str]]
     lyric_events: list[tuple[int, str]]
+    lyric_tokens: list[LyricToken]
     total_slots: int
     was_truncated: bool
 
@@ -1529,7 +1653,13 @@ def place_measure_dividers(lines: dict[int, list[str]], measure_slots: list[int]
             continue
         for line in lines.values():
             start = slot * SLOT_WIDTH
-            if start < len(line):
+            if start >= len(line):
+                continue
+            # A downbeat fret owns this column. Put the bar just before it
+            # so a two-digit fret is not printed as "|2".
+            if line[start] not in "- " and start > 0 and line[start - 1] in "- ":
+                line[start - 1] = "|"
+            elif line[start] in "- ":
                 line[start] = "|"
 
 
@@ -1551,14 +1681,24 @@ def build_chord_line(total_slots: int, chord_events: list[tuple[int, str]]) -> s
 
 
 def build_lyric_line(total_slots: int, lyric_events: list[tuple[int, str]]) -> str:
-    """Build a character-grid lyric line aligned to slot positions."""
+    """Build a character-grid lyric line aligned to slot positions.
+
+    A syllable keeps its slot unless that would run into the next syllable.
+    Words stay separated by a space. A syllable that already ends in a hyphen
+    may touch the next one, so "be-" and "yond" read as "be-yond".
+    """
     line = [" "] * (total_slots * SLOT_WIDTH)
-    for slot, text in lyric_events:
-        start = slot * SLOT_WIDTH
+    cursor = 0
+    for slot, text in sorted(lyric_events, key=lambda item: item[0]):
+        if not text:
+            continue
+        start = max(slot * SLOT_WIDTH, cursor)
+        end = start + len(text)
+        if end > len(line):
+            line.extend([" "] * (end - len(line)))
         for idx, ch in enumerate(text):
-            pos = start + idx
-            if pos < len(line):
-                line[pos] = ch
+            line[start + idx] = ch
+        cursor = end if text.endswith("-") else end + 1
     return "".join(line).rstrip()
 
 
@@ -1755,6 +1895,23 @@ def infer_simple_chord_label(midi_values: list[int]) -> str:
     if bass_pc != best_root:
         label = f"{label}/{pc_to_name(bass_pc)}"
     return label
+
+
+def text_is_standalone_chord(raw_value: str) -> bool:
+    """True when the whole string is a chord symbol, not a word that contains one.
+
+    Lyric and expression text is only a chord when nothing is left after the
+    symbol is removed. That keeps the word "the" from becoming an E chord.
+    """
+    raw = (raw_value or "").strip().strip("[](){}")
+    if not raw:
+        return False
+    token = extract_chord_token(raw)
+    if not token or not CHORD_TEXT_RE.match(token):
+        return False
+    folded = re.sub(r"[^A-Za-z0-9#/]", "", raw).lower()
+    token_folded = re.sub(r"[^A-Za-z0-9#/]", "", token).lower()
+    return bool(folded) and folded == token_folded
 
 
 def extract_chord_token(raw_value: str) -> Optional[str]:
@@ -1972,27 +2129,47 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     bass_events, bass_max_slot = collect_part_events(bass_source, mode="low", voice_filter=bass_voice)
     comp_source: Optional[stream.Stream] = parts[1] if len(parts) >= 3 else None
 
-    # Extract lyrics from the melody source so they can be displayed below the tab.
+    # Extract lyrics from the melody source so they can be displayed below the tab
+    # and laid out as a chord chart. lyric_events keeps the first verse for the
+    # fret staff; lyric_tokens keeps every verse and syllable break.
     lyric_events: list[tuple[int, str]] = []
+    lyric_tokens: list[LyricToken] = []
     for _n in melody_source.flatten().notes:
-        if not isinstance(_n, note.Note):
+        if not isinstance(_n, (note.Note, chord.Chord)):
             continue
         _slot = quarter_to_slot(float(_n.offset))
         if _slot >= MAX_SLOTS:
             continue
-        _text: Optional[str] = None
-        for _lyr in (getattr(_n, "lyrics", None) or []):
+        _lyrics = list(getattr(_n, "lyrics", None) or [])
+        if not _lyrics:
+            _raw = getattr(_n, "lyric", None)
+            if _raw and str(_raw).strip():
+                _text = str(_raw).strip()
+                lyric_events.append((_slot, _text))
+                lyric_tokens.append(LyricToken(_slot, _text, "single", 1))
+            continue
+        _first_text: Optional[str] = None
+        for _lyr in _lyrics:
             _t = getattr(_lyr, "text", None)
-            if _t:
-                _text = _t.strip()
-                break
-        if not _text:
-            _t2 = getattr(_n, "lyric", None)
-            if _t2:
-                _text = str(_t2).strip()
-        if _text:
-            lyric_events.append((_slot, _text))
+            if not _t or not str(_t).strip():
+                continue
+            _text = str(_t).strip()
+            _syll = str(getattr(_lyr, "syllabic", None) or "single").split(".")[-1].lower()
+            if _syll not in {"begin", "middle", "end", "single"}:
+                _syll = "single"
+            if _first_text is None:
+                _first_text = _text
+                if _syll in {"begin", "middle"} and not _first_text.endswith("-"):
+                    _first_text += "-"
+            try:
+                _verse = int(getattr(_lyr, "number", None) or 1)
+            except (TypeError, ValueError):
+                _verse = 1
+            lyric_tokens.append(LyricToken(_slot, _text, _syll, _verse))
+        if _first_text:
+            lyric_events.append((_slot, _first_text))
     lyric_events.sort(key=lambda x: x[0])
+    lyric_tokens.sort(key=lambda token: (token.verse, token.slot))
 
     # In Standard/Complete, use "highest note per slot" from top staff as a
     # fallback when voice-ID filtering is sparse — but prefer the voice-filtered
@@ -2169,14 +2346,17 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     # Fallback: many OMR exports parse chord text as generic text expressions.
     for text_item in score.recurse().getElementsByClass(expressions.TextExpression):
         raw_value = str(getattr(text_item, "content", None) or text_item or "").strip()
-        add_chord_event(raw_value, text_item)
+        if text_is_standalone_chord(raw_value):
+            add_chord_event(raw_value, text_item)
 
     # Additional fallback: some OMR exports chord names as rehearsal marks.
     for mark in score.recurse().getElementsByClass(expressions.RehearsalMark):
         raw_value = str(getattr(mark, "content", None) or mark or "").strip()
-        add_chord_event(raw_value, mark)
+        if text_is_standalone_chord(raw_value):
+            add_chord_event(raw_value, mark)
 
-    # Additional fallback: some OMR exports chord names as note/chord lyrics.
+    # Additional fallback: some OMR exports chord names as note lyrics.
+    # Require an uppercase root so the word "a" is not read as an A chord.
     for n in score.recurse().notes:
         raw_lyrics: list[str] = []
         if isinstance(n, note.Note):
@@ -2192,7 +2372,11 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                 if text_val:
                     raw_lyrics.append(str(text_val))
         for raw in raw_lyrics:
-            add_chord_event(raw.strip(), n)
+            stripped = raw.strip()
+            if not stripped[:1].isupper():
+                continue
+            if text_is_standalone_chord(stripped):
+                add_chord_event(stripped, n)
 
     has_explicit_chords = len(chord_events) > 0
 
@@ -2479,6 +2663,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         chord_events=chord_events,
         section_events=section_events,
         lyric_events=lyric_events,
+        lyric_tokens=lyric_tokens,
         total_slots=total_slots,
         was_truncated=was_truncated,
     )
@@ -2532,6 +2717,445 @@ def _build_tab_row_html(chord_chunk: str, row_lines: list[tuple[str, str]], row_
     )
 
 
+def _collapse_chord_changes(chord_events: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    changes: list[tuple[int, str]] = []
+    previous = ""
+    for slot, label in chord_events:
+        if not label or label == previous:
+            continue
+        changes.append((slot, label))
+        previous = label
+    return changes
+
+
+def _estimate_bar_slots(measure_slots: list[int]) -> int:
+    starts = sorted({slot for slot in measure_slots if slot >= 0})
+    diffs = [b - a for a, b in zip(starts, starts[1:]) if b > a]
+    if not diffs:
+        return 16
+    diffs.sort()
+    return diffs[len(diffs) // 2]
+
+
+def _words_from_tokens(tokens: list[LyricToken]) -> list[tuple[int, str]]:
+    """Join begin/middle/end syllables into words. Returns (slot, text)."""
+    words: list[tuple[int, str]] = []
+    buf_slot: Optional[int] = None
+    buf_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal buf_slot, buf_parts
+        if buf_parts and buf_slot is not None:
+            words.append((buf_slot, "".join(buf_parts)))
+        buf_slot = None
+        buf_parts = []
+
+    def append_syllable(text: str) -> None:
+        if buf_parts and not buf_parts[-1].endswith("-"):
+            buf_parts.append("-")
+        buf_parts.append(text)
+
+    for token in tokens:
+        kind = token.syllabic
+        if kind == "begin":
+            if buf_parts:
+                flush()
+            buf_slot = token.slot
+            buf_parts = [token.text]
+        elif kind == "middle":
+            if buf_slot is None:
+                buf_slot = token.slot
+            append_syllable(token.text)
+        elif kind == "end":
+            if buf_slot is None:
+                buf_slot = token.slot
+            append_syllable(token.text)
+            flush()
+        else:
+            # MusicXML often stores a broken word as plain text ("be-", "yond")
+            # with syllabic "single" instead of begin/end.
+            hyphenated = token.text.endswith("-")
+            continuing = bool(buf_parts and buf_parts[-1].endswith("-"))
+            if hyphenated or continuing:
+                if buf_slot is None:
+                    buf_slot = token.slot
+                append_syllable(token.text)
+                if not hyphenated:
+                    flush()
+            else:
+                if buf_parts:
+                    flush()
+                words.append((token.slot, token.text))
+    flush()
+    return words
+
+
+def _split_lyric_lines(
+    words: list[tuple[int, str]],
+    bar_slots: int,
+) -> list[list[tuple[int, str]]]:
+    lines: list[list[tuple[int, str]]] = []
+    current: list[tuple[int, str]] = []
+    current_len = 0
+    for slot, text in words:
+        gap = (slot - current[-1][0]) if current else 0
+        if current and (gap > bar_slots or current_len >= 42):
+            lines.append(current)
+            current = []
+            current_len = 0
+        current.append((slot, text))
+        current_len += len(text) + 1
+        if text.endswith((".", "!", "?")) and current_len >= 18:
+            lines.append(current)
+            current = []
+            current_len = 0
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _assign_chords_to_words(
+    words: list[tuple[int, str]],
+    changes: list[tuple[int, str]],
+) -> list[tuple[str, str, int]]:
+    """Return (text, chord_or_empty, slot). Chord is shown only where it changes."""
+    assigned: list[tuple[str, str, int]] = []
+    index = 0
+    active = ""
+    shown = ""
+    for slot, text in words:
+        while index < len(changes) and changes[index][0] <= slot:
+            active = changes[index][1]
+            index += 1
+        chord_name = active if active and active != shown else ""
+        if chord_name:
+            shown = active
+        assigned.append((text, chord_name, slot))
+    return assigned
+
+
+def _sections_between(sections: list[tuple[int, str]], start_exclusive: int, end_inclusive: int) -> list[str]:
+    return [label for slot, label in sections if start_exclusive < slot <= end_inclusive]
+
+
+def _shape_fingering(shape: list[Optional[int]]) -> str:
+    cells = ["x" if fret is None else str(fret) for fret in shape]
+    if any(fret is not None and fret >= 10 for fret in shape):
+        return "-".join(cells)
+    return "".join(cells)
+
+
+def _diagram_svg(label: str, shape: list[Optional[int]]) -> str:
+    frets_shown = 4
+    played = [fret for fret in shape if isinstance(fret, int) and fret > 0]
+    start = 1
+    if played and max(played) > frets_shown:
+        start = min(played)
+        if max(played) - start + 1 > frets_shown:
+            frets_shown = max(played) - start + 1
+    left = 18
+    top = 22
+    gap_x = 10
+    gap_y = 14
+    width = left + gap_x * 5 + 14
+    height = top + gap_y * frets_shown + 6
+    parts = [
+        f'<svg class="chord-svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
+        f'role="img" aria-label="{html.escape(label)} chord diagram">'
+    ]
+    for index, fret in enumerate(shape):
+        x = left + index * gap_x
+        if fret is None:
+            parts.append(
+                f'<text x="{x}" y="13" text-anchor="middle" font-size="11" fill="#6b6452">×</text>'
+            )
+        elif fret == 0:
+            parts.append(
+                f'<circle cx="{x}" cy="9" r="3.5" fill="none" stroke="#242424" stroke-width="1.2"/>'
+            )
+    if start > 1:
+        parts.append(
+            f'<text x="2" y="{top + 12}" font-size="10" fill="#5f5a47">{start}</text>'
+        )
+    nut_width = "3" if start == 1 else "1"
+    parts.append(
+        f'<line x1="{left}" y1="{top}" x2="{left + gap_x * 5}" y2="{top}" '
+        f'stroke="#242424" stroke-width="{nut_width}"/>'
+    )
+    for fret_no in range(1, frets_shown + 1):
+        y = top + fret_no * gap_y
+        parts.append(
+            f'<line x1="{left}" y1="{y}" x2="{left + gap_x * 5}" y2="{y}" stroke="#c8c0a8" stroke-width="1"/>'
+        )
+    for string_index in range(6):
+        x = left + string_index * gap_x
+        parts.append(
+            f'<line x1="{x}" y1="{top}" x2="{x}" y2="{top + frets_shown * gap_y}" '
+            f'stroke="#242424" stroke-width="1"/>'
+        )
+    for index, fret in enumerate(shape):
+        if not isinstance(fret, int) or fret <= 0:
+            continue
+        relative = fret - start + 1
+        if relative < 1 or relative > frets_shown:
+            continue
+        x = left + index * gap_x
+        y = top + (relative - 0.5) * gap_y
+        parts.append(f'<circle cx="{x}" cy="{y:.1f}" r="4" fill="#242424"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _diagram_html(label: str) -> str:
+    shape = lookup_chord_shape(label)
+    name = html.escape(label)
+    if shape is None:
+        return (
+            f'<div class="chord-diagram"><div class="chord-diagram-name">{name}</div>'
+            f'<div class="chord-diagram-missing">no open shape</div></div>'
+        )
+    return (
+        f'<div class="chord-diagram"><div class="chord-diagram-name">{name}</div>'
+        f'{_diagram_svg(label, shape)}</div>'
+    )
+
+
+def _plain_stacked_lines(stacked: list[list[tuple[str, str]]]) -> str:
+    if not stacked or not stacked[0]:
+        return ""
+    width_count = len(stacked[0])
+    widths: list[int] = []
+    for index in range(width_count):
+        width = max(len(stacked[0][index][0]), len(stacked[0][index][1]))
+        for extra in stacked[1:]:
+            if index < len(extra):
+                width = max(width, len(extra[index][0]))
+        widths.append(width)
+    lines: list[str] = []
+    if any(chord_name for _, chord_name in stacked[0]):
+        lines.append("  ".join(stacked[0][index][1].ljust(widths[index]) for index in range(width_count)).rstrip())
+    for verse in stacked:
+        count = min(len(verse), width_count)
+        lines.append("  ".join(verse[index][0].ljust(widths[index]) for index in range(count)).rstrip())
+    return "\n".join(lines)
+
+
+def _plain_lyric_line(words: list[tuple[str, str]]) -> str:
+    if not words:
+        return ""
+    if not any(chord_name for _, chord_name in words):
+        return " ".join(text for text, _ in words)
+    chord_cells: list[str] = []
+    lyric_cells: list[str] = []
+    for text, chord_name in words:
+        width = max(len(text), len(chord_name))
+        chord_cells.append(chord_name.ljust(width))
+        lyric_cells.append(text.ljust(width))
+    return "  ".join(chord_cells).rstrip() + "\n" + "  ".join(lyric_cells).rstrip()
+
+
+def _html_lyric_line(lines_by_verse: list[list[tuple[str, str]]]) -> str:
+    """Stack matching verse lines. Chords come from the first verse."""
+    if not lines_by_verse or not lines_by_verse[0]:
+        return ""
+    primary = lines_by_verse[0]
+    spans: list[str] = []
+    for index, (text, chord_name) in enumerate(primary):
+        alt = []
+        for extra in lines_by_verse[1:]:
+            if index < len(extra):
+                alt.append(f'<span class="chart-syll chart-syll-alt">{html.escape(extra[index][0])}</span>')
+        spans.append(
+            '<span class="chart-word">'
+            f'<span class="chart-chord">{html.escape(chord_name)}</span>'
+            f'<span class="chart-syll">{html.escape(text)}</span>'
+            f'{"".join(alt)}'
+            "</span>"
+        )
+    return f'<div class="chart-line">{"".join(spans)}</div>'
+
+
+def _measure_chord_labels(
+    changes: list[tuple[int, str]],
+    measure_slots: list[int],
+    total_slots: int,
+    last_slot: Optional[int] = None,
+) -> list[tuple[int, str]]:
+    starts = sorted({slot for slot in measure_slots if 0 <= slot < total_slots})
+    if last_slot is not None:
+        starts = [slot for slot in starts if slot <= last_slot]
+    if not starts or starts[0] != 0:
+        starts = [0] + starts
+    labels: list[tuple[int, str]] = []
+    active = ""
+    change_index = 0
+    for slot in starts:
+        while change_index < len(changes) and changes[change_index][0] <= slot:
+            active = changes[change_index][1]
+            change_index += 1
+        if active:
+            labels.append((slot, active))
+    return labels
+
+
+def build_chord_chart(events: ScoreEvents) -> tuple[str, str]:
+    """Chord diagrams plus lyrics with chord names, in the lead-sheet layout.
+
+    Returns (html, plain). Both are empty when the score has neither chords nor lyrics.
+    """
+    changes = _collapse_chord_changes(events.chord_events)
+    tokens = [token for token in events.lyric_tokens if token.text]
+    if not changes and not tokens:
+        return "", ""
+
+    bar_slots = _estimate_bar_slots(events.measure_slots)
+    verses: dict[int, list[LyricToken]] = {}
+    for token in tokens:
+        verses.setdefault(token.verse, []).append(token)
+    verse_numbers = sorted(verses)
+    verse_words = {number: _words_from_tokens(verses[number]) for number in verse_numbers}
+
+    first_lyric_slot = min((token.slot for token in tokens), default=events.total_slots)
+    content_slots = [slot for slot, _label in changes]
+    content_slots.extend(token.slot for token in tokens)
+    last_content_slot = max(content_slots) if content_slots else 0
+    unique_labels: list[str] = []
+    seen_labels: set[str] = set()
+    for _, label in changes:
+        if label not in seen_labels:
+            seen_labels.add(label)
+            unique_labels.append(label)
+
+    html_parts: list[str] = [
+        '<section class="chord-chart">',
+        '<h3 class="view-label">Chord chart</h3>',
+        '<p class="chart-tuning">Tuning E A D G B E</p>',
+    ]
+    plain_parts: list[str] = ["# Chord chart", "Tuning: E A D G B E", ""]
+
+    if unique_labels:
+        html_parts.append('<div class="chart-diagrams">')
+        html_parts.extend(_diagram_html(label) for label in unique_labels)
+        html_parts.append("</div>")
+        fingering_lines = []
+        for label in unique_labels:
+            shape = lookup_chord_shape(label)
+            fingering_lines.append(f"{label}: {_shape_fingering(shape)}" if shape else f"{label}:")
+        plain_parts.append(" ".join(fingering_lines))
+        plain_parts.append("")
+
+    def render_progression(labels: list[tuple[int, str]], heading: str) -> None:
+        if not labels:
+            return
+        compressed: list[str] = []
+        run_label = ""
+        run_count = 0
+
+        def flush_run() -> None:
+            nonlocal run_label, run_count
+            if not run_label:
+                return
+            compressed.append(run_label if run_count == 1 else f"{run_label} ×{run_count}")
+            run_label = ""
+            run_count = 0
+
+        for _, label in labels:
+            if label == run_label:
+                run_count += 1
+            else:
+                flush_run()
+                run_label = label
+                run_count = 1
+        flush_run()
+        if heading:
+            html_parts.append(f'<div class="chart-section">{html.escape(heading)}</div>')
+            plain_parts.append(heading)
+        html_parts.append(
+            '<div class="chart-line chart-intro">'
+            + "".join(f'<span class="chart-chord">{html.escape(label)}</span>' for label in compressed)
+            + "</div>"
+        )
+        plain_parts.append("  ".join(compressed))
+        plain_parts.append("")
+
+    if not verse_words:
+        measure_labels = _measure_chord_labels(
+            changes, events.measure_slots, events.total_slots, last_content_slot
+        )
+        previous_slot = -1
+        chunk: list[tuple[int, str]] = []
+        pending_heading = ""
+        for slot, label in measure_labels:
+            headers = _sections_between(events.section_events, previous_slot, slot)
+            if headers and chunk:
+                render_progression(chunk, pending_heading)
+                chunk = []
+                pending_heading = " ".join(headers)
+            elif headers:
+                pending_heading = " ".join(headers)
+            chunk.append((slot, label))
+            previous_slot = slot
+        render_progression(chunk, pending_heading or ("Chords" if not events.section_events else ""))
+    else:
+        intro_labels = [
+            (slot, label)
+            for slot, label in _measure_chord_labels(
+                changes, events.measure_slots, events.total_slots, last_content_slot
+            )
+            if slot < first_lyric_slot
+        ]
+        intro_headers = _sections_between(events.section_events, -1, first_lyric_slot - 1)
+        render_progression(intro_labels, " ".join(intro_headers) if intro_headers else ("Intro" if intro_labels else ""))
+
+        verse_lines = {
+            number: _split_lyric_lines(verse_words[number], bar_slots)
+            for number in verse_numbers
+        }
+        primary = verse_numbers[0]
+        primary_lines = verse_lines[primary]
+        extras = [verse_lines[number] for number in verse_numbers[1:]]
+        aligned = bool(extras) and all(len(extra) == len(primary_lines) for extra in extras)
+        if aligned:
+            aligned = all(
+                len(extra[index]) == len(primary_lines[index])
+                for extra in extras
+                for index in range(len(primary_lines))
+            )
+
+        previous_slot = first_lyric_slot - 1
+        for line_index, line in enumerate(primary_lines):
+            assigned = _assign_chords_to_words([(slot, text) for slot, text in line], changes)
+            headers = _sections_between(events.section_events, previous_slot, line[0][0])
+            if headers:
+                heading = " ".join(headers)
+                html_parts.append(f'<div class="chart-section">{html.escape(heading)}</div>')
+                plain_parts.append(heading)
+            stacked = [[(text, chord_name) for text, chord_name, _slot in assigned]]
+            if aligned:
+                for extra in extras:
+                    extra_assigned = _assign_chords_to_words(extra[line_index], changes)
+                    stacked.append([(text, chord_name) for text, chord_name, _slot in extra_assigned])
+            html_parts.append(_html_lyric_line(stacked))
+            plain_parts.append(_plain_stacked_lines(stacked))
+            plain_parts.append("")
+            previous_slot = line[-1][0]
+
+        if not aligned:
+            for number in verse_numbers[1:]:
+                html_parts.append(f'<div class="chart-section">Lyric {number}</div>')
+                plain_parts.append(f"Lyric {number}")
+                for line in verse_lines[number]:
+                    assigned = _assign_chords_to_words(line, changes)
+                    words = [(text, chord_name) for text, chord_name, _slot in assigned]
+                    html_parts.append(_html_lyric_line([words]))
+                    plain_parts.append(_plain_lyric_line(words))
+                    plain_parts.append("")
+
+    html_parts.append("</section>")
+    plain = "\n".join(part for part in plain_parts if part is not None).rstrip() + "\n"
+    return "".join(html_parts), plain
+
+
 def arrange_tab(
     score: stream.Score,
     difficulty: TabDifficulty = TabDifficulty.STANDARD,
@@ -2575,6 +3199,16 @@ def arrange_tab(
     display_inner_events = [(remap_slot(slot), midi_value) for slot, midi_value in events.inner_events]
     display_played_chord_events = [(remap_slot(slot), midi_values) for slot, midi_values in events.played_chord_events]
     display_chord_events = [(remap_slot(slot), label) for slot, label in events.chord_events]
+    # Lyric anchoring copies the active chord onto every sung slot. Keep one
+    # label per change so shapes and the chord line are not stamped on each word.
+    collapsed_chords: list[tuple[int, str]] = []
+    previous_chord = ""
+    for slot, label in display_chord_events:
+        if label == previous_chord:
+            continue
+        collapsed_chords.append((slot, label))
+        previous_chord = label
+    display_chord_events = collapsed_chords
     display_section_events = [(remap_slot(slot), label) for slot, label in events.section_events]
     display_lyric_events = [(remap_slot(slot), text) for slot, text in events.lyric_events]
     display_measure_slots = sorted({remap_slot(slot) for slot in measure_starts})
@@ -2606,6 +3240,8 @@ def arrange_tab(
         prefer_open: bool = True,
         near_position: Optional[tuple[int, int]] = None,
         melody_ceiling: Optional[int] = None,
+        favor_fret: Optional[int] = None,
+        stay_on_string: bool = False,
     ) -> Optional[tuple[int, int]]:
         if melody_ceiling is not None and midi_value > melody_ceiling:
             return None
@@ -2617,7 +3253,28 @@ def arrange_tab(
         )
         if near_position is not None and candidates:
             last_string, last_fret = near_position
-            candidates = sorted(candidates, key=lambda c: (abs(c[1] - last_fret), abs(c[0] - last_string), c[1]))
+            if stay_on_string:
+                # A 3-fret slide on the same string beats a string change that
+                # saves one fret (e 15 then e 12, not B 17).
+                candidates = sorted(
+                    candidates,
+                    key=lambda c: (
+                        0 if c[0] == last_string and abs(c[1] - last_fret) <= 4 else 1,
+                        abs(c[1] - last_fret),
+                        abs(c[0] - last_string),
+                        c[1],
+                    ),
+                )
+            else:
+                candidates = sorted(candidates, key=lambda c: (abs(c[1] - last_fret), abs(c[0] - last_string), c[1]))
+        # A note whose highest-string fingering sits well below the phrase
+        # (high-e 8 in a fret-13 phrase) is easier on the next string, same position.
+        if favor_fret is not None and candidates:
+            close = [item for item in candidates if abs(item[1] - favor_fret) <= 2]
+            if close:
+                close.sort(key=lambda item: (abs(item[1] - favor_fret), -item[0], item[1]))
+                close_set = set(close)
+                candidates = close + [item for item in candidates if item not in close_set]
         for string_index, fret in candidates:
             if not slot_is_free(lines[string_index], slot):
                 continue
@@ -2643,15 +3300,54 @@ def arrange_tab(
         strong_beat_slots.add(ms_start)  # beat 1 always
         strong_beat_slots.add(ms_start + 8)  # beat 3 in 4/4 (8 slots = 2 quarter notes)
 
+    def _highest_string_fret(midi_value: int) -> Optional[int]:
+        for string_index in (5, 4, 3, 2, 1, 0):
+            fret = midi_value - STANDARD_TUNING[string_index]
+            if 0 <= fret <= melody_max_fret:
+                return fret
+        return None
+
+    # One fret center per phrase, from the highest-string fingering of each note.
+    # Notes that would reach several frets below that center can move to the
+    # next string and stay in position (e fret 8 -> B fret 13).
+    phrase_fret_by_slot: dict[int, int] = {}
+    phrase: list[tuple[int, int]] = []
+    phrases: list[list[tuple[int, int]]] = []
+    for slot, midi_value in display_melody_events:
+        if slot >= display_total_slots:
+            continue
+        if phrase and slot - phrase[-1][0] > 16:
+            phrases.append(phrase)
+            phrase = []
+        phrase.append((slot, midi_value))
+    if phrase:
+        phrases.append(phrase)
+    for phrase in phrases:
+        frets = sorted(
+            fret for _, midi_value in phrase if (fret := _highest_string_fret(midi_value)) is not None
+        )
+        if not frets:
+            continue
+        center = frets[len(frets) // 2]
+        for slot, _midi_value in phrase:
+            phrase_fret_by_slot[slot] = center
+
     def _place_melody_note(slot: int, midi_value: int) -> None:
         """Place a single melody note. Always succeeds — retries without span limit."""
         nonlocal last_melody_pos
+        center = phrase_fret_by_slot.get(slot)
+        high_fret = _highest_string_fret(midi_value)
+        favor_fret = center if (
+            center is not None and high_fret is not None and center - high_fret >= 4
+        ) else None
         placed = try_place_midi_at_slot(
             slot, midi_value,
             preferred_strings=[5, 4, 3, 2, 1, 0],
             max_fret=melody_max_fret,
             prefer_open=False,
             near_position=last_melody_pos,
+            favor_fret=favor_fret,
+            stay_on_string=True,
         )
         if placed is None:
             placed = try_place_midi_at_slot(
@@ -2660,6 +3356,8 @@ def arrange_tab(
                 max_fret=melody_max_fret,
                 span_limit=99,
                 prefer_open=False,
+                favor_fret=favor_fret,
+                stay_on_string=True,
             )
         if placed is not None:
             last_melody_pos = placed
@@ -2727,21 +3425,45 @@ def arrange_tab(
             _place_melody_note(slot, midi_value)
 
         # Pass 2: bass on strong beats only (root or lowest available note).
+        # A vocal lead sheet has no bass staff, so the extracted "bass" is the
+        # melody itself. In that case play the open-chord root instead.
         last_bass_pos: Optional[tuple[int, int]] = None
         bass_by_slot = {slot: midi for slot, midi in display_bass_events if slot < display_total_slots}
+        bass_is_melody = bool(bass_by_slot) and all(
+            melody_pitch_by_slot.get(slot) == midi for slot, midi in bass_by_slot.items()
+        )
+        chord_changes = sorted(
+            (slot, label) for slot, label in display_chord_events if 0 <= slot < display_total_slots
+        )
+
+        def chord_bass_at(slot: int) -> Optional[int]:
+            label = ""
+            for change_slot, change_label in chord_changes:
+                if change_slot <= slot:
+                    label = change_label
+                else:
+                    break
+            return chord_bass_midi(label) if label else None
+
         for slot in sorted(strong_beat_slots):
             if slot >= display_total_slots:
                 continue
-            midi_value = bass_by_slot.get(slot)
-            if midi_value is None:
-                # No explicit bass note — look for the nearest one within 2 slots.
-                for offset in [0, 2, 1, -1, -2]:
-                    midi_value = bass_by_slot.get(slot + offset)
-                    if midi_value is not None:
-                        break
+            melody_ceiling = melody_pitch_by_slot.get(slot)
+            midi_value: Optional[int] = None
+            if not bass_is_melody:
+                midi_value = bass_by_slot.get(slot)
+                if midi_value is None:
+                    # No explicit bass note — look for the nearest one within 2 slots.
+                    for offset in [0, 2, 1, -1, -2]:
+                        midi_value = bass_by_slot.get(slot + offset)
+                        if midi_value is not None:
+                            break
+            if midi_value is None or (melody_ceiling is not None and midi_value >= melody_ceiling):
+                chord_bass = chord_bass_at(slot)
+                if chord_bass is not None and (melody_ceiling is None or chord_bass < melody_ceiling):
+                    midi_value = chord_bass
             if midi_value is None:
                 continue
-            melody_ceiling = melody_pitch_by_slot.get(slot)
             placed = try_place_midi_at_slot(
                 slot, midi_value,
                 preferred_strings=[0, 1, 2],
@@ -2928,8 +3650,16 @@ def arrange_tab(
         html_rows.append(_build_tab_row_html(chord_chunk, row_lines, row_note=row_note, lyric_chunk=lyric_chunk, row_idx=row_idx))
         plain_rows.append("\n".join(plain_block))
 
-    tab_html = f'<div class="tab-container">{"".join(html_rows)}</div>'
+    tab_html = (
+        '<p class="tab-edit-hint">Click any fret number to remove that note.</p>'
+        f'<div class="tab-container">{"".join(html_rows)}</div>'
+    )
     tab_plain = "\n\n".join(plain_rows)
+    chart_html, chart_plain = build_chord_chart(events)
+    if chart_html:
+        tab_html = chart_html + '<h3 class="view-label">Fret tab</h3>' + tab_html
+    if chart_plain:
+        tab_plain = chart_plain + "\n" + tab_plain
     accuracy, playability = score_placement(
         lines,
         display_melody_events,
