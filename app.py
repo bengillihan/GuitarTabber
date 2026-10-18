@@ -17,6 +17,7 @@ from flask import Flask, Response, abort, redirect, render_template_string, requ
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from music21 import bar, chord, converter, expressions, harmony, meter, note, pitch, stream
+from music21 import key as m21key
 from werkzeug.utils import secure_filename
 
 
@@ -37,6 +38,10 @@ MEASURES_PER_ROW = 4
 # Row wrapping always happens at measure boundaries.
 TAB_TARGET_CHARS_PER_ROW = 192
 MAX_FRETTED_SPAN = 5
+# Fingerstyle bass and melody have to sit in one hand shape. A reach of 4
+# frets is the limit, so fret 8 against fret 3 is rejected and the bass
+# moves up the neck to the melody instead.
+FINGERSTYLE_HAND_SPAN = 4
 KEY_TONICS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 KEY_MODES = ["major", "minor"]
 GUITAR_MIN_MIDI = 40
@@ -1463,59 +1468,130 @@ def convert_with_musescore(source_path: Path, work_dir: Path) -> Optional[Path]:
 
     cmd = [ms_bin, "-o", str(output_path), str(source_path)]
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS
         )
-        if output_path.exists() and output_path.stat().st_size > 0:
-            return output_path
     except (subprocess.TimeoutExpired, OSError):
         pass
 
-    # MuseScore sometimes writes the file even on non-zero exit; check again.
+    # MuseScore sometimes writes the file even on non-zero exit; check it, and
+    # make sure it actually contains notes (it can emit an empty score).
     if output_path.exists() and output_path.stat().st_size > 0:
-        return output_path
+        if _musicxml_note_count(output_path) >= MIN_OMR_NOTES:
+            return output_path
 
     return None
 
 
-def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path]:
+MIN_OMR_NOTES = 8
+
+
+def _musicxml_note_count(path: Path) -> int:
+    try:
+        parsed = converter.parse(str(path))
+        return sum(len(n.pitches) for n in parsed.flatten().notes)
+    except Exception:
+        return 0
+
+
+def rasterize_pdf_pages(source_path: Path, work_dir: Path, dpi: int = 350) -> list[Path]:
+    """Rasterize every PDF page and run the scan cleanup on each."""
     gs_bin = shutil.which("gs")
     if gs_bin is None:
-        return None
+        return []
     image_dir = work_dir / "omr_raster"
     image_dir.mkdir(parents=True, exist_ok=True)
-    output_png = image_dir / f"{source_path.stem}_page1_300dpi.png"
+    pattern = image_dir / f"{source_path.stem}_page%03d_{dpi}dpi.png"
     cmd = [
-        gs_bin,
-        "-dSAFER",
-        "-dBATCH",
-        "-dNOPAUSE",
-        "-sDEVICE=pnggray",
-        "-r300",
-        "-dFirstPage=1",
-        "-dLastPage=1",
-        f"-sOutputFile={output_png}",
-        str(source_path),
+        gs_bin, "-dSAFER", "-dBATCH", "-dNOPAUSE", "-sDEVICE=pnggray",
+        f"-r{dpi}", f"-sOutputFile={pattern}", str(source_path),
     ]
-    completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS)
-    if completed.returncode != 0 or not output_png.exists():
-        return None
-    return output_png
+    try:
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=OMR_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if completed.returncode != 0:
+        return []
+    pages = sorted(image_dir.glob(f"{source_path.stem}_page*_{dpi}dpi.png"))
+    cleaned: list[Path] = []
+    for page in pages:
+        try:
+            cleaned.append(preprocess_image_for_omr(page, work_dir))
+        except Exception:
+            cleaned.append(page)
+    return cleaned
+
+
+def rasterize_pdf_first_page(source_path: Path, work_dir: Path) -> Optional[Path]:
+    """Back-compat wrapper: first page of rasterize_pdf_pages."""
+    pages = rasterize_pdf_pages(source_path, work_dir)
+    return pages[0] if pages else None
+
+
+def _audiveris_on_pages(audiveris_bin: str, pages: list[Path], work_dir: Path) -> list[Path]:
+    output_dir_retry = work_dir / "omr_exports_retry"
+    output_dir_retry.mkdir(parents=True, exist_ok=True)
+    for page in pages:
+        try:
+            run_audiveris_export(audiveris_bin, output_dir_retry, page)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return collect_generated_musicxml(output_dir_retry)
+
+
+def _score_omr_candidate(paths: list[Path]) -> tuple[float, list[str]]:
+    scores: list[stream.Score] = []
+    for p in paths:
+        try:
+            scores.append(converter.parse(str(p)))
+        except Exception:
+            continue
+    if not scores:
+        return 0.0, ["Output could not be parsed."]
+    try:
+        combined = combine_scores_sequential(scores)
+    except Exception:
+        combined = scores[0]
+    return validate_score(combined)
+
+
+# Last OMR quality report per work_dir (confidence, issues, engine).
+OMR_REPORTS: dict[str, dict[str, Any]] = {}
 
 
 def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
     """
     Convert PDF/image sheet music to MusicXML.
 
-    Strategy (most accurate first):
-      1. MuseScore CLI  — best note/chord-symbol recognition for typeset PDFs
-      2. Audiveris      — fallback when MuseScore is not installed
+    Every available engine is run (MuseScore CLI, then Audiveris); each
+    result is scored with validate_score and the best one is kept. The
+    quality report is stored in OMR_REPORTS[str(work_dir)].
     """
-    # --- MuseScore (primary, most accurate) ---
+    results: list[tuple[float, list[str], str, list[Path]]] = []
+    errors: list[str] = []
+
     ms_result = convert_with_musescore(source_path, work_dir)
     if ms_result is not None:
-        return [ms_result]
+        conf, issues = _score_omr_candidate([ms_result])
+        results.append((conf, issues, "MuseScore", [ms_result]))
 
+    try:
+        aud_paths = _convert_with_audiveris(source_path, work_dir)
+        if aud_paths:
+            conf, issues = _score_omr_candidate(aud_paths)
+            results.append((conf, issues, "Audiveris", aud_paths))
+    except OMRConversionError as exc:
+        errors.append(str(exc))
+
+    if not results:
+        raise OMRConversionError(errors[0] if errors else "No OMR engine produced MusicXML output.")
+    best = max(results, key=lambda r: r[0])
+    OMR_REPORTS[str(work_dir)] = {"confidence": best[0], "issues": best[1], "engine": best[2]}
+    return best[3]
+
+
+def _convert_with_audiveris(source_path: Path, work_dir: Path) -> list[Path]:
+    """Audiveris path (original fallback logic, now retrying on every PDF page)."""
     # --- Preprocess camera/phone images before handing to Audiveris. ---
     # Converts HEIC → PNG and applies contrast enhancement.
     if file_extension(source_path.name) in IMAGE_EXTENSIONS:
@@ -1549,36 +1625,21 @@ def convert_sheet_to_musicxml(source_path: Path, work_dir: Path) -> list[Path]:
         # Retry path for camera-photo PDFs: rasterize first page and retry Audiveris
         # on a high-resolution grayscale PNG, which is often more robust than direct PDF.
         if file_extension(source_path.name) == "pdf":
-            raster_png = rasterize_pdf_first_page(source_path, work_dir)
-            if raster_png is not None:
-                output_dir_retry = work_dir / "omr_exports_retry"
-                output_dir_retry.mkdir(parents=True, exist_ok=True)
-                try:
-                    retry_code, retry_stdout, retry_stderr = run_audiveris_export(audiveris_bin, output_dir_retry, raster_png)
-                except subprocess.TimeoutExpired:
-                    retry_code = 1
-                    retry_stdout = ""
-                    retry_stderr = "timeout during retry from rasterized PDF"
-                retry_generated = collect_generated_musicxml(output_dir_retry)
+            raster_pages = rasterize_pdf_pages(source_path, work_dir)
+            if raster_pages:
+                retry_generated = _audiveris_on_pages(audiveris_bin, raster_pages, work_dir)
                 if retry_generated:
                     return retry_generated
-                retry_detail = (retry_stderr or retry_stdout or f"exit code {retry_code}").strip()
                 raise OMRConversionError(
-                    f"Audiveris conversion failed: {detail}. Retry from rasterized PDF also failed: {retry_detail}"
+                    f"Audiveris conversion failed: {detail}. Retry from rasterized PDF pages also failed."
                 )
         raise OMRConversionError(f"Audiveris conversion failed: {detail}")
 
     if not generated:
         if file_extension(source_path.name) == "pdf":
-            raster_png = rasterize_pdf_first_page(source_path, work_dir)
-            if raster_png is not None:
-                output_dir_retry = work_dir / "omr_exports_retry"
-                output_dir_retry.mkdir(parents=True, exist_ok=True)
-                try:
-                    run_audiveris_export(audiveris_bin, output_dir_retry, raster_png)
-                except subprocess.TimeoutExpired:
-                    pass
-                retry_generated = collect_generated_musicxml(output_dir_retry)
+            raster_pages = rasterize_pdf_pages(source_path, work_dir)
+            if raster_pages:
+                retry_generated = _audiveris_on_pages(audiveris_bin, raster_pages, work_dir)
                 if retry_generated:
                     return retry_generated
         raise OMRConversionError("Audiveris ran but no MusicXML output was produced.")
@@ -1958,14 +2019,430 @@ def keep_easy_chord_slot(slot: int, measure_starts: list[int], first_ts: Optiona
 
 
 def _part_has_lyrics(part: stream.Stream) -> bool:
-    """Return True if any note in the part has an attached lyric."""
+    """Return True if any note (or chord) in the part has an attached lyric."""
     for n in part.flatten().notes:
-        if isinstance(n, note.Note):
+        if isinstance(n, (note.Note, chord.Chord)):
             if getattr(n, "lyric", None):
                 return True
             if any(getattr(lyr, "text", None) for lyr in (getattr(n, "lyrics", []) or [])):
                 return True
     return False
+
+
+def _iter_part_notes_with_voice(part: stream.Stream) -> list[dict[str, Any]]:
+    """Flatten a part into note records that keep voice id and stem direction.
+
+    Each record: offset/end (quarters, part-relative), midi, voice (str|None),
+    stem ('up'/'down'/None), is_chord_top (bool), chord_size (int).
+    """
+    records: list[dict[str, Any]] = []
+
+    def add(el: Any, base: float, voice_id: Optional[str]) -> None:
+        if isinstance(el, note.Note):
+            midis = [int(el.pitch.midi)]
+        elif isinstance(el, chord.Chord):
+            midis = sorted(int(p.midi) for p in el.pitches)
+        else:
+            return
+        if not midis:
+            return
+        off = base + float(el.offset)
+        dur = float(el.quarterLength or 0.0)
+        stem = getattr(el, "stemDirection", None)
+        stem = str(stem) if stem in ("up", "down") else None
+        for i, m in enumerate(midis):
+            records.append({
+                "offset": off, "end": off + max(dur, 0.0), "midi": m,
+                "voice": voice_id, "stem": stem,
+                "is_chord_top": i == len(midis) - 1, "chord_size": len(midis),
+            })
+
+    measures = list(part.getElementsByClass(stream.Measure))
+    if measures:
+        for m in measures:
+            base = float(m.offset)
+            for v in m.voices:
+                vid = str(v.id) if v.id is not None else None
+                for el in v.notes:
+                    add(el, base + float(v.offset), vid)
+            for el in m.notes:
+                raw_voice = getattr(el, "voice", None)
+                add(el, base, str(raw_voice) if raw_voice is not None else None)
+    else:
+        for el in part.flatten().notes:
+            raw_voice = getattr(el, "voice", None)
+            add(el, 0.0, str(raw_voice) if raw_voice is not None else None)
+    records.sort(key=lambda r: (r["offset"], -r["midi"]))
+    return records
+
+
+def part_is_polyphonic(part: stream.Stream, threshold: float = 0.3) -> bool:
+    """True when the staff carries two or more voices (e.g. soprano + alto)."""
+    records = _iter_part_notes_with_voice(part)
+    if not records:
+        return False
+    voices = {r["voice"] for r in records if r["voice"] is not None}
+    if len(voices) >= 2:
+        return True
+    by_onset: dict[float, int] = {}
+    for r in records:
+        by_onset[r["offset"]] = by_onset.get(r["offset"], 0) + 1
+    multi = sum(1 for c in by_onset.values() if c >= 2)
+    return multi / max(1, len(by_onset)) >= threshold
+
+
+def extract_soprano(part: stream.Stream) -> tuple[list[tuple[int, int]], int]:
+    """Pick the soprano line from a staff shared by soprano and alto.
+
+    Priority: MusicXML voice 1 → up-stems → top chord note. A held soprano note
+    blocks lower notes (alto moves) that start while it is still sounding.
+    Notes with no voice label are kept only when their stem is up or they have
+    no competing note at the same onset.
+    """
+    records = _iter_part_notes_with_voice(part)
+    if not records:
+        return [], 0
+    onset_counts: dict[float, int] = {}
+    for r in records:
+        onset_counts[r["offset"]] = onset_counts.get(r["offset"], 0) + 1
+
+    voices = {r["voice"] for r in records if r["voice"] is not None}
+    stems = {r["stem"] for r in records if r["stem"] is not None}
+    if "1" in voices and len(voices) >= 2:
+        candidates = [
+            r for r in records
+            if r["voice"] == "1"
+            or (r["voice"] is None and (r["stem"] == "up" or onset_counts[r["offset"]] == 1))
+        ]
+    elif {"up", "down"} <= stems:
+        candidates = [
+            r for r in records
+            if r["stem"] == "up" or (r["stem"] is None and onset_counts[r["offset"]] == 1)
+        ]
+    else:
+        candidates = list(records)
+
+    # Top note per onset, with held-note blocking.
+    best_by_onset: dict[float, dict[str, Any]] = {}
+    for r in candidates:
+        cur = best_by_onset.get(r["offset"])
+        if cur is None or r["midi"] > cur["midi"]:
+            best_by_onset[r["offset"]] = r
+    events: list[tuple[int, int]] = []
+    prev: Optional[dict[str, Any]] = None
+    max_slot = 0
+    for off in sorted(best_by_onset):
+        r = best_by_onset[off]
+        if prev is not None and prev["end"] > off + 1e-6 and prev["midi"] >= r["midi"]:
+            continue
+        slot = quarter_to_slot(off)
+        events.append((slot, r["midi"]))
+        max_slot = max(max_slot, quarter_to_slot(r["end"]), slot + 1)
+        prev = r
+    return events, max_slot
+
+
+def shift_melody_to_range(events: list[tuple[int, int]], lo: int, hi: int) -> list[tuple[int, int]]:
+    """Move the whole melody by octaves so its shape is kept, then fold outliers."""
+    if not events:
+        return events
+    midis = [m for _, m in events]
+    best_shift = 0
+    best_key: Optional[tuple[int, int, int]] = None
+    for k in range(-4, 5):
+        shift = 12 * k
+        outside = sum(1 for m in midis if not (lo <= m + shift <= hi))
+        dist = sum(max(0, lo - (m + shift)) + max(0, (m + shift) - hi) for m in midis)
+        key_val = (outside, dist, abs(k))
+        if best_key is None or key_val < best_key:
+            best_key = key_val
+            best_shift = shift
+    out: list[tuple[int, int]] = []
+    for s, m in events:
+        v = m + best_shift
+        while v > hi:
+            v -= 12
+        while v < lo:
+            v += 12
+        out.append((s, v))
+    return out
+
+
+_MAJOR_DEGREES = [  # (interval from tonic, quality, roman)
+    ("P1", "", "I"), ("M2", "m", "ii"), ("M3", "m", "iii"), ("P4", "", "IV"),
+    ("P5", "", "V"), ("P5", "7", "V7"), ("M6", "m", "vi"),
+]
+_MINOR_DEGREES = [
+    ("P1", "m", "i"), ("m3", "", "III"), ("P4", "m", "iv"), ("P5", "", "V"),
+    ("P5", "7", "V7"), ("m6", "", "VI"), ("m7", "", "VII"),
+]
+_COMMON_MOVES = {
+    ("ii", "V"), ("ii", "V7"), ("IV", "I"), ("V", "I"), ("V7", "I"), ("IV", "V"),
+    ("I", "IV"), ("I", "V"), ("vi", "ii"), ("vi", "IV"), ("iv", "i"), ("V", "i"),
+    ("V7", "i"), ("iv", "V"), ("i", "iv"), ("i", "V"), ("VI", "iv"), ("V", "vi"),
+}
+
+
+def _diatonic_chord_candidates(key_obj: Any) -> list[dict[str, Any]]:
+    tonic = key_obj.tonic
+    minor = str(getattr(key_obj, "mode", "major")) == "minor"
+    out: list[dict[str, Any]] = []
+    for ivl, quality, roman in (_MINOR_DEGREES if minor else _MAJOR_DEGREES):
+        root = tonic.transpose(ivl)
+        rpc = root.pitchClass
+        third = 3 if quality == "m" else 4
+        pcs = {rpc, (rpc + third) % 12, (rpc + 7) % 12}
+        if quality == "7":
+            pcs.add((rpc + 10) % 12)
+        name = root.name.replace("-", "b")
+        label = f"{name}{'m' if quality == 'm' else ''}{'7' if quality == '7' else ''}"
+        out.append({
+            "label": label, "root": rpc, "pcs": pcs, "roman": roman,
+            "third": (rpc + third) % 12, "fifth": (rpc + 7) % 12,
+            "seventh": (rpc + 10) % 12 if quality == "7" else None,
+        })
+    return out
+
+
+def _measure_spans(score: stream.Score) -> list[tuple[float, float, float]]:
+    """(start, actual_length, nominal_bar_length) per measure of the top part."""
+    parts = list(score.parts)
+    src = parts[0] if parts else score
+    spans: list[tuple[float, float, float]] = []
+    ts_len = 4.0
+    for m in src.getElementsByClass(stream.Measure):
+        ts = m.timeSignature
+        if ts is not None and ts.barDuration is not None:
+            ts_len = float(ts.barDuration.quarterLength)
+        length = float(m.duration.quarterLength or 0.0) or ts_len
+        spans.append((float(m.offset), length, ts_len))
+    return spans
+
+
+def infer_hymn_chords(score: stream.Score, key_obj: Any = None) -> list[tuple[int, str]]:
+    """Key-aware chord inference for hymn/SATB scores.
+
+    Splits each bar into half-bar windows, weights sounding notes (including
+    held ones, via chordify) by duration and beat, scores only diatonic chords
+    (I ii iii IV V V7 vi in major), then picks the best sequence with a small
+    Viterbi pass that favours staying put and common moves. Returns
+    (slot, label) pairs at chord changes. Slash chords only appear when the
+    bass holds the chord's 3rd or 5th for the whole window (half a bar).
+    """
+    try:
+        if key_obj is None:
+            key_obj = score.analyze("key")
+        candidates = _diatonic_chord_candidates(key_obj)
+        slices = list(score.chordify().flatten().notes)
+    except Exception:
+        return []
+    if not candidates or not slices:
+        return []
+
+    spans = _measure_spans(score)
+    if not spans:
+        end = float(score.highestTime)
+        spans = [(o, 4.0, 4.0) for o in [i * 4.0 for i in range(int(end // 4) + 1)]]
+    windows: list[tuple[float, float]] = []
+    for start, length, nominal in spans:
+        if length >= nominal - 1e-6 and nominal >= 4.0 and nominal % 2 == 0:
+            half = length / 2.0
+            windows.append((start, start + half))
+            windows.append((start + half, start + length))
+        else:
+            windows.append((start, start + length))
+
+    slice_data: list[tuple[float, float, list[int]]] = []
+    for c in slices:
+        midis = [int(p.midi) for p in getattr(c, "pitches", [])]
+        if midis:
+            off = float(c.offset)
+            slice_data.append((off, off + float(c.quarterLength or 0.0), midis))
+
+    emissions: list[Optional[list[float]]] = []
+    bass_hold: list[dict[int, float]] = []
+    for w_start, w_end in windows:
+        w_len = max(1e-6, w_end - w_start)
+        weights: dict[int, float] = {}
+        bass_pcs: dict[int, float] = {}
+        first_bass: Optional[int] = None
+        for s_off, s_end, midis in slice_data:
+            ov = min(s_end, w_end) - max(s_off, w_start)
+            if ov <= 1e-6:
+                continue
+            accent = 1.5 if s_off <= w_start + 1e-6 else 1.0
+            for m in midis:
+                weights[m % 12] = weights.get(m % 12, 0.0) + ov * accent
+            low = min(midis) % 12
+            bass_pcs[low] = bass_pcs.get(low, 0.0) + ov
+            if s_off <= w_start + 1e-6:
+                first_bass = low  # slice sounding at the window's downbeat
+        bass_hold.append({pc: d / w_len for pc, d in bass_pcs.items()})
+        total = sum(weights.values())
+        if total <= 0:
+            emissions.append(None)
+            continue
+        row: list[float] = []
+        for cand in candidates:
+            inside = sum(w for pc, w in weights.items() if pc in cand["pcs"])
+            outside = total - inside
+            score_val = (inside - 0.8 * outside) / total
+            # Every chord tone present? reward completeness.
+            present = sum(1 for pc in cand["pcs"] if weights.get(pc, 0) > 0)
+            score_val += 0.08 * present
+            if first_bass is not None and first_bass == cand["root"]:
+                score_val += 0.25
+            if cand["seventh"] is not None:
+                score_val -= 0.12 if weights.get(cand["seventh"], 0) > 0 else 0.6
+            row.append(score_val)
+        emissions.append(row)
+
+    n_c = len(candidates)
+    stay_bonus, move_bonus = 0.15, 0.08
+
+    def trans(a: int, b: int) -> float:
+        if a == b:
+            return stay_bonus
+        if (candidates[a]["roman"], candidates[b]["roman"]) in _COMMON_MOVES:
+            return move_bonus
+        return 0.0
+
+    best: list[float] = [0.0] * n_c
+    back: list[list[int]] = []
+    for w_idx, row in enumerate(emissions):
+        new_best = [0.0] * n_c
+        ptr = [0] * n_c
+        for j in range(n_c):
+            emit = row[j] if row is not None else 0.0
+            if w_idx == 0:
+                new_best[j] = emit + (0.1 if candidates[j]["roman"] in ("I", "i") else 0.0)
+                continue
+            choice = max(range(n_c), key=lambda i: best[i] + trans(i, j))
+            ptr[j] = choice
+            new_best[j] = best[choice] + trans(choice, j) + emit
+        back.append(ptr)
+        best = new_best
+    path = [max(range(n_c), key=lambda j: best[j])]
+    for w_idx in range(len(emissions) - 1, 0, -1):
+        path.append(back[w_idx][path[-1]])
+    path.reverse()
+
+    events: list[tuple[int, str]] = []
+    last = ""
+    for w_idx, c_idx in enumerate(path):
+        if emissions[w_idx] is None:
+            continue
+        cand = candidates[c_idx]
+        label = cand["label"]
+        for pc, frac in bass_hold[w_idx].items():
+            if frac >= 0.99 and pc in (cand["third"], cand["fifth"]) and pc != cand["root"]:
+                label = f"{label}/{pc_to_name(pc)}"
+                break
+        if label != last:
+            events.append((quarter_to_slot(windows[w_idx][0]), label))
+            last = label
+    return events
+
+
+def score_is_harmonic(score: stream.Score, threshold: float = 0.3) -> bool:
+    """True when at least `threshold` of chordified slices hold 3+ pitches."""
+    try:
+        slices = list(score.chordify().flatten().notes)
+    except Exception:
+        return False
+    if not slices:
+        return False
+    full = sum(1 for c in slices if len({int(p.midi) for p in c.pitches}) >= 3)
+    return full / len(slices) >= threshold
+
+
+_SATB_RANGES = [(60, 81, "soprano"), (55, 74, "alto"), (48, 69, "tenor"), (40, 62, "bass")]
+
+
+def validate_score(score: stream.Score) -> tuple[float, list[str]]:
+    """Sanity-check an OMR result. Returns (confidence 0..1, issues)."""
+    issues: list[str] = []
+    penalty = 0.0
+    try:
+        notes_all = [n for n in score.flatten().notes]
+    except Exception:
+        return 0.0, ["Score could not be read."]
+    n_notes = sum(len(n.pitches) for n in notes_all)
+    if n_notes < 8:
+        return 0.0, [f"Only {n_notes} notes were recognised."]
+
+    # Bar lengths vs time signature (allow pickup first bar and short last bar).
+    bad_bars: list[int] = []
+    for part in score.parts:
+        measures = list(part.getElementsByClass(stream.Measure))
+        ts_len: Optional[float] = None
+        for idx, m in enumerate(measures):
+            if m.timeSignature is not None and m.timeSignature.barDuration is not None:
+                ts_len = float(m.timeSignature.barDuration.quarterLength)
+            if ts_len is None:
+                continue
+            voices = list(m.voices)
+            lengths = [float(v.highestTime) for v in voices] if voices else [float(m.highestTime)]
+            content = max(lengths) if lengths else 0.0
+            if abs(content - ts_len) < 1e-3:
+                continue
+            if content < ts_len and idx in (0, len(measures) - 1):
+                continue
+            num = getattr(m, "number", idx + 1)
+            if num not in bad_bars:
+                bad_bars.append(num)
+    if bad_bars:
+        penalty += min(0.5, 0.05 * len(bad_bars))
+        issues.append(f"Bar length doesn't match the time signature in bar(s) {', '.join(map(str, bad_bars[:6]))}.")
+
+    # Key signature vs analysed key, and share of out-of-key notes.
+    try:
+        analyzed = score.analyze("key")
+        ks = next(iter(score.recurse().getElementsByClass(m21key.KeySignature)), None)
+        if ks is not None and getattr(ks, "sharps", None) is not None and analyzed.sharps != ks.sharps:
+            penalty += 0.1
+            issues.append(f"Written key signature disagrees with the notes (sounds like {analyzed.tonic.name} {analyzed.mode}).")
+        scale_pcs = {p.pitchClass for p in analyzed.getScale().getPitches()}
+        outside = sum(1 for n in notes_all for p in n.pitches if p.pitchClass not in scale_pcs)
+        frac = outside / max(1, n_notes)
+        if frac > 0.15:
+            penalty += min(0.3, frac)
+            issues.append(f"{int(frac * 100)}% of notes are outside the key.")
+    except Exception:
+        pass
+
+    # Voice ranges (SATB) when the score looks like four voices.
+    parts = list(score.parts)
+    if 2 <= len(parts) <= 4:
+        out_of_range = 0
+        total = 0
+        voice_lists: list[list[int]] = []
+        if len(parts) == 2:
+            for p in parts:
+                recs = _iter_part_notes_with_voice(p)
+                hi = [r["midi"] for r in recs if r["voice"] in (None, "1")]
+                lo = [r["midi"] for r in recs if r["voice"] not in (None, "1")]
+                voice_lists.extend([hi, lo or hi])
+        else:
+            voice_lists = [[int(pp.midi) for n in p.flatten().notes for pp in n.pitches] for p in parts]
+        for (lo_r, hi_r, _), midis in zip(_SATB_RANGES[-len(voice_lists):] if len(voice_lists) < 4 else _SATB_RANGES, voice_lists):
+            total += len(midis)
+            out_of_range += sum(1 for m in midis if m < lo_r - 2 or m > hi_r + 2)
+        if total and out_of_range / total > 0.1:
+            penalty += min(0.3, out_of_range / total)
+            issues.append(f"{out_of_range} notes are outside normal voice ranges.")
+
+    # Lyric syllables per melody note.
+    if parts:
+        top_notes = [n for n in parts[0].flatten().notes]
+        with_lyric = sum(1 for n in top_notes if getattr(n, "lyrics", None))
+        if with_lyric and top_notes:
+            ratio = with_lyric / len(top_notes)
+            if ratio < 0.4:
+                penalty += 0.1
+                issues.append("Many melody notes have no lyric syllable (lyrics may be misread).")
+
+    return max(0.0, 1.0 - penalty), issues
 
 
 def _melody_note_count(part: stream.Stream) -> int:
@@ -2176,7 +2653,18 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     # soprano events when they cover ≥ 75% of the top-staff slots, since voice 1
     # is more accurate than a brute-force pitch max (which can mix in alto notes
     # when the soprano holds while the alto moves).
-    if parts and difficulty != TabDifficulty.EASY:
+    # SATB / shared-staff soprano extraction: when the melody staff carries two
+    # voices (soprano + alto), pick the soprano via voice 1 → up-stems → top
+    # note, with held soprano notes blocking alto moves.
+    soprano_used = False
+    if parts and isinstance(melody_source, stream.Stream) and part_is_polyphonic(melody_source):
+        soprano_events, soprano_max = extract_soprano(melody_source)
+        if soprano_events:
+            melody_events = soprano_events
+            melody_max_slot = max(melody_max_slot, soprano_max)
+            soprano_used = True
+
+    if parts and difficulty != TabDifficulty.EASY and not soprano_used:
         top_staff_reference = melody_source if has_lyric_part else parts[0]
         top_staff_events, top_staff_max_slot = collect_highest_per_slot(top_staff_reference)
         voice_coverage = len(melody_events) / max(1, len(top_staff_events))
@@ -2217,14 +2705,16 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         sparse_threshold = max(4, int(all_noteheads * 0.05))
 
         # Pass 1: unfiltered melody source (no voice filter).
-        if len(melody_events) < sparse_threshold:
+        if len(melody_events) < sparse_threshold and not soprano_used:
             p1, p1_max = collect_part_events(melody_source, mode="high", voice_filter=None)
             melody_events = merge_melody(melody_events, p1)
             melody_max_slot = max(melody_max_slot, p1_max)
 
         # If lyrics are present, treat lyric-bearing noteheads as high-confidence
         # melody anchors so syllabic melody notes are not lost in polyphonic OMR.
-        lyric_melody, lyric_melody_max = collect_lyric_melody(melody_source)
+        # (Skipped when the soprano was extracted: lyric anchors there can pull
+        # in alto notes that start while the soprano is held.)
+        lyric_melody, lyric_melody_max = collect_lyric_melody(melody_source) if not soprano_used else ([], 0)
         if lyric_melody:
             melody_events = merge_melody(melody_events, lyric_melody)
             melody_max_slot = max(melody_max_slot, lyric_melody_max)
@@ -2235,7 +2725,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
         lyric_slots = {s for s, _ in lyric_events}
         present_slots = {s for s, _ in melody_events}
         recovered: list[tuple[int, int]] = []
-        for slot in sorted(lyric_slots - present_slots):
+        for slot in ([] if soprano_used else sorted(lyric_slots - present_slots)):
             offset = slot / 4.0
             vertical = full_flat.notes.getElementsByOffset(
                 offset,
@@ -2255,7 +2745,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             melody_events = merge_melody(melody_events, recovered)
             melody_max_slot = max(melody_max_slot, max(s for s, _ in recovered) + 1)
 
-        if has_lyric_part:
+        if has_lyric_part or soprano_used:
             # A vocal part was identified by lyrics — trust it exclusively.
             # Merging from other parts pulls in piano accompaniment patterns
             # and replaces the real melody with chord/bass filler.
@@ -2292,7 +2782,9 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
             v += 12
         return v
 
-    melody_events = [(s, _to_guitar_range(m)) for s, m in melody_events]
+    # Shift the whole melody by octaves (keeps the tune's shape); individual
+    # outliers are then folded like _to_guitar_range does.
+    melody_events = shift_melody_to_range(melody_events, GUITAR_MIN_MIDI, GUITAR_MAX_MIDI)
     bass_events = [(s, _to_guitar_range(m)) for s, m in bass_events]
 
     # Keep one clear melodic pitch per slot (highest) and one bass pitch (lowest).
@@ -2379,6 +2871,27 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
                 add_chord_event(stripped, n)
 
     has_explicit_chords = len(chord_events) > 0
+
+    # Key-aware hymn inference (SATB / chordal scores). Printed chords are used
+    # as written; bars that have no printed chord are filled from the notes.
+    hymn_inferred = False
+    if score_is_harmonic(score):
+        inferred = infer_hymn_chords(score)
+        if inferred:
+            hymn_inferred = True
+            explicit_bars: set[int] = set()
+            for slot, _ in chord_events:
+                explicit_bars.add(bisect_right(measure_slots, slot) - 1 if measure_slots else 0)
+            for slot, label in inferred:
+                bar_idx = bisect_right(measure_slots, slot) - 1 if measure_slots else 0
+                if bar_idx in explicit_bars or slot in seen_chord_slots:
+                    continue
+                if not is_valid_chord_label(normalize_chord_label(label)):
+                    continue
+                seen_chord_slots.add(slot)
+                chord_events.append((slot, label))
+            # Inferred chords replace the legacy per-beat / bass-staff guessers below.
+            has_explicit_chords = True
 
     # Capture explicit written chord attacks (especially in lower staves) so
     # they can be rendered as actual tab notes, not only labels.
@@ -2609,7 +3122,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     # hasn't actually changed.
     last_fallback_label = ""
     last_fallback_root = ""
-    for slot, midi_values in sorted(played_chord_events, key=lambda x: x[0]):
+    for slot, midi_values in ([] if hymn_inferred else sorted(played_chord_events, key=lambda x: x[0])):
         if slot in seen_chord_slots:
             continue
         guessed = normalize_chord_label(infer_simple_chord_label(midi_values))
@@ -2629,7 +3142,7 @@ def gather_events(score: stream.Score, difficulty: TabDifficulty = TabDifficulty
     if parts:
         for n in parts[0].flatten().notes:
             texts: list[str] = []
-            if isinstance(n, note.Note):
+            if isinstance(n, (note.Note, chord.Chord)):
                 if getattr(n, "lyric", None):
                     texts.append(str(n.lyric))
                 for lyr in getattr(n, "lyrics", []) or []:
@@ -3445,9 +3958,79 @@ def arrange_tab(
                     break
             return chord_bass_midi(label) if label else None
 
-        for slot in sorted(strong_beat_slots):
-            if slot >= display_total_slots:
-                continue
+        bass_slots_sorted = sorted(slot for slot in strong_beat_slots if slot < display_total_slots)
+
+        def fret_on(string_index: int, slot: int) -> Optional[int]:
+            start = slot * SLOT_WIDTH
+            token = "".join(ch for ch in lines[string_index][start:start + SLOT_WIDTH] if ch.isdigit())
+            return int(token) if token else None
+
+        def clear_fret(string_index: int, slot: int) -> None:
+            fret = fret_on(string_index, slot)
+            start = slot * SLOT_WIDTH
+            for offset in range(SLOT_WIDTH):
+                if start + offset < len(lines[string_index]):
+                    lines[string_index][start + offset] = "-"
+            frets = slot_fretted_notes.get(slot)
+            if fret is not None and frets and fret in frets:
+                frets.remove(fret)
+
+        def melody_between(start_slot: int, end_slot: int) -> list[list[int]]:
+            found: list[list[int]] = []
+            for mel_slot, midi in display_melody_events:
+                if not (start_slot <= mel_slot < end_slot):
+                    continue
+                for string_index in range(6):
+                    fret = fret_on(string_index, mel_slot)
+                    if fret is not None:
+                        found.append([mel_slot, string_index, fret, midi])
+                        break
+            return found
+
+        def move_melody_near(item: list[int], anchor_fret: int) -> bool:
+            mel_slot, current_string, current_fret, midi = item
+            options = find_positions(
+                midi,
+                preferred_strings=[5, 4, 3, 2, 1, 0],
+                max_fret=melody_max_fret,
+                prefer_open=False,
+            )
+            options = [
+                (string_index, fret)
+                for string_index, fret in options
+                if (fret == 0 or abs(fret - anchor_fret) <= FINGERSTYLE_HAND_SPAN)
+                and (string_index == current_string or slot_is_free(lines[string_index], mel_slot))
+            ]
+            if not options:
+                return False
+            options.sort(key=lambda choice: (abs(choice[1] - anchor_fret), -choice[0], choice[1]))
+            new_string, new_fret = options[0]
+            if (new_string, new_fret) == (current_string, current_fret):
+                return False
+            clear_fret(current_string, mel_slot)
+            place_token(lines[new_string], mel_slot, str(new_fret))
+            slot_fretted_notes.setdefault(mel_slot, []).append(new_fret)
+            item[1] = new_string
+            item[2] = new_fret
+            return True
+
+        def group_span(anchor_fret: int, items: list[list[int]]) -> int:
+            frets = [anchor_fret] + [item[2] for item in items if item[2] > 0]
+            return max(frets) - min(frets) if frets else 0
+
+        def fit_melody_to_bass(anchor_fret: int, items: list[list[int]]) -> bool:
+            for _ in range(8):
+                if group_span(anchor_fret, items) <= FINGERSTYLE_HAND_SPAN:
+                    return True
+                movable = [item for item in items if item[2] > 0]
+                if not movable:
+                    return False
+                worst = max(movable, key=lambda item: (abs(item[2] - anchor_fret), item[2]))
+                if not move_melody_near(worst, anchor_fret):
+                    return False
+            return group_span(anchor_fret, items) <= FINGERSTYLE_HAND_SPAN
+
+        for index, slot in enumerate(bass_slots_sorted):
             melody_ceiling = melody_pitch_by_slot.get(slot)
             midi_value: Optional[int] = None
             if not bass_is_melody:
@@ -3464,15 +4047,48 @@ def arrange_tab(
                     midi_value = chord_bass
             if midi_value is None:
                 continue
-            placed = try_place_midi_at_slot(
-                slot, midi_value,
-                preferred_strings=[0, 1, 2],
-                max_fret=bass_max_fret,
-                near_position=last_bass_pos,
-                melody_ceiling=melody_ceiling,
-            )
-            if placed is not None:
-                last_bass_pos = placed
+
+            hold_end = display_total_slots
+            if index + 1 < len(bass_slots_sorted):
+                hold_end = bass_slots_sorted[index + 1]
+            later_measures = [start for start in display_measure_slots if start > slot]
+            if later_measures:
+                hold_end = min(hold_end, later_measures[0])
+            window = melody_between(slot, hold_end)
+            if not window:
+                continue
+            window_ceiling = min(item[3] for item in window)
+            pitch_class = midi_value % 12
+            fingerings: list[tuple[int, int]] = []
+            for string_index in (0, 1, 2):
+                for fret in range(0, 13):
+                    sounding = STANDARD_TUNING[string_index] + fret
+                    if sounding % 12 != pitch_class:
+                        continue
+                    if window_ceiling is not None and sounding >= window_ceiling:
+                        continue
+                    if not slot_is_free(lines[string_index], slot):
+                        continue
+                    fingerings.append((string_index, fret))
+            if not fingerings:
+                continue
+
+            def fingering_cost(choice: tuple[int, int]) -> tuple[int, int, int]:
+                _string_index, fret = choice
+                frets = [fret] + [item[2] for item in window if item[2] > 0]
+                extra = max(0, (max(frets) - min(frets)) - FINGERSTYLE_HAND_SPAN)
+                return (extra, fret, abs(fret - last_bass_pos[1]) if last_bass_pos else 0)
+
+            string_index, fret = min(fingerings, key=fingering_cost)
+            if not fit_melody_to_bass(fret, window):
+                continue
+            if not slot_is_free(lines[string_index], slot):
+                continue
+            if not can_place_fret_at_slot(slot_fretted_notes.get(slot, []), fret, max_fretted_span=FINGERSTYLE_HAND_SPAN):
+                continue
+            place_token(lines[string_index], slot, str(fret))
+            slot_fretted_notes.setdefault(slot, []).append(fret)
+            last_bass_pos = (string_index, fret)
 
         # Pass 3 (COMPLETE only): add inner-voice notes on off-beats, staying below melody.
         if difficulty == TabDifficulty.COMPLETE:
